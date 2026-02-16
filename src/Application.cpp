@@ -4,6 +4,7 @@
 #include "ExplorerPathProvider.h"
 #include "RenamerService.h"
 #include "UiRenderer.h"
+#include "UpdateService.h"
 #include "resource.h"
 
 #include <windowsx.h>
@@ -27,7 +28,9 @@ namespace fs = std::filesystem;
 
 namespace {
 const wchar_t* WINDOW_CLASS_NAME = L"FileRenamerWinApiClass";
-const wchar_t* STYLED_DIALOG_CLASS_NAME = L"FileRenamerStyledDialogClass";
+const wchar_t* INFO_WINDOW_CLASS_NAME = L"FileRenamerInfoWindowClass";
+const wchar_t* MESSAGE_WINDOW_CLASS_NAME = L"FileRenamerMessageWindowClass";
+const wchar_t* APP_VERSION = L"1.0.0";
 
 enum ControlId {
     ID_FOLDER_EDIT = 1001,
@@ -38,21 +41,52 @@ enum ControlId {
     ID_IGNORE_CASE_CHECKBOX = 1006,
     ID_RENAME_BUTTON = 1007,
     ID_CURRENT_PREVIEW = 1008,
-    ID_RESULT_PREVIEW = 1009
+    ID_RESULT_PREVIEW = 1009,
+    ID_HELP_BUTTON = 1010
 };
 
-enum StyledDialogControlId {
-    ID_STYLED_DIALOG_TEXT = 2001,
-    ID_STYLED_DIALOG_OK = 2002
+enum MenuId {
+    ID_MENU_HELP_HOTKEYS = 2001,
+    ID_MENU_HELP_ABOUT = 2002,
+    ID_MENU_HELP_SEPARATOR = 2003
 };
 
-struct StyledDialogState {
+enum InfoControlId {
+    ID_INFO_TEXT = 2101,
+    ID_INFO_CLOSE = 2102,
+    ID_INFO_CHECK_UPDATES = 2103
+};
+
+enum MessageControlId {
+    ID_MESSAGE_TEXT = 2201,
+    ID_MESSAGE_PRIMARY = 2202,
+    ID_MESSAGE_SECONDARY = 2203
+};
+
+struct InfoWindowState {
     Application* owner;
-    std::wstring message;
+    int kind;
+    HWND textControl;
+    HWND closeButton;
+    HWND checkUpdatesButton;
+    std::wstring text;
     HFONT font;
     HBRUSH editBrush;
+};
+
+struct MessageWindowState {
+    Application* owner;
     HWND textControl;
-    HWND okButton;
+    HWND primaryButton;
+    HWND secondaryButton;
+    HFONT font;
+    HBRUSH editBrush;
+    std::wstring text;
+    std::wstring primaryButtonText;
+    std::wstring secondaryButtonText;
+    bool hasSecondaryButton;
+    int result;
+    int* resultOut;
 };
 
 std::wstring Trim(const std::wstring& text) {
@@ -85,6 +119,24 @@ std::wstring PathCompareKey(const std::wstring& rawPath) {
     });
     return key;
 }
+
+const wchar_t* GetHelpMenuItemText(UINT itemId) {
+    switch (itemId) {
+    case ID_MENU_HELP_HOTKEYS:
+        return L"Горячие клавиши";
+    case ID_MENU_HELP_ABOUT:
+        return L"О программе";
+    default:
+        return nullptr;
+    }
+}
+
+const wchar_t* GetMenuItemText(UINT itemId, ULONG_PTR itemData) {
+    if (itemData != 0) {
+        return reinterpret_cast<const wchar_t*>(itemData);
+    }
+    return GetHelpMenuItemText(itemId);
+}
 } // namespace
 
 Application::Application()
@@ -100,11 +152,15 @@ Application::Application()
     , m_hRegexCheckbox(nullptr)
     , m_hIgnoreCaseCheckbox(nullptr)
     , m_hRenameButton(nullptr)
+    , m_hHelpButton(nullptr)
     , m_hStatusLabel(nullptr)
     , m_hCurrentLabel(nullptr)
     , m_hResultLabel(nullptr)
     , m_hCurrentPreview(nullptr)
     , m_hResultPreview(nullptr)
+    , m_hHotkeysWindow(nullptr)
+    , m_hAboutWindow(nullptr)
+    , m_hHelpMenu(nullptr)
     , m_hBackgroundBrush(nullptr)
     , m_hCardBrush(nullptr)
     , m_hFont(nullptr)
@@ -113,7 +169,8 @@ Application::Application()
     , m_comInitialized(false)
     , m_useRegex(false)
     , m_ignoreCase(false)
-    , m_styledDialogClassRegistered(false)
+    , m_infoWindowClassRegistered(false)
+    , m_messageWindowClassRegistered(false)
     , m_hoveredControl(nullptr)
     , m_pressedControl(nullptr) {
 }
@@ -187,10 +244,16 @@ bool Application::Initialize(HINSTANCE hInstance) {
     SetWindowTextW(m_hWnd, Application::WINDOW_TITLE);
 
     CreateControls();
-    if (!RegisterStyledDialogClass()) {
+    CreateHelpMenu();
+    if (!RegisterInfoWindowClass()) {
+        MessageBox(nullptr, L"Не удалось зарегистрировать класс информационного окна", L"Ошибка", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    if (!RegisterMessageWindowClass()) {
         MessageBox(nullptr, L"Не удалось зарегистрировать класс диалога сообщений", L"Ошибка", MB_OK | MB_ICONERROR);
         return false;
     }
+    m_updateService = std::make_unique<UpdateService>();
 
     RECT clientRect = {};
     GetClientRect(m_hWnd, &clientRect);
@@ -281,6 +344,13 @@ void Application::Shutdown() {
         KillTimer(m_hWnd, EXPLORER_SYNC_TIMER_ID);
     }
 
+    if (m_hHelpMenu) {
+        DestroyMenu(m_hHelpMenu);
+        m_hHelpMenu = nullptr;
+    }
+
+    m_updateService.reset();
+
     if (m_hFont) {
         DeleteObject(m_hFont);
         m_hFont = nullptr;
@@ -335,19 +405,111 @@ LRESULT CALLBACK Application::WindowProc(HWND hWnd, UINT message, WPARAM wParam,
 LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_COMMAND:
-        OnCommand(LOWORD(wParam), HIWORD(wParam));
+        if (lParam == 0) {
+            OnMenuCommand(LOWORD(wParam));
+        } else {
+            OnCommand(LOWORD(wParam), HIWORD(wParam));
+        }
         return 0;
+
+    case WM_MEASUREITEM:
+        {
+            MEASUREITEMSTRUCT* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+            if (!mis || mis->CtlType != ODT_MENU) {
+                break;
+            }
+
+            if (mis->itemID == ID_MENU_HELP_SEPARATOR) {
+                mis->itemWidth = 60;
+                mis->itemHeight = 10;
+                return TRUE;
+            }
+
+            const wchar_t* text = GetMenuItemText(mis->itemID, mis->itemData);
+            if (!text) {
+                break;
+            }
+
+            HDC hdc = GetDC(m_hWnd);
+            if (!hdc) {
+                break;
+            }
+
+            HFONT hMenuFont = m_hFont ? m_hFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+            HFONT hOldFont = static_cast<HFONT>(SelectObject(hdc, hMenuFont));
+            SIZE textSize = {};
+            GetTextExtentPoint32W(hdc, text, static_cast<int>(wcslen(text)), &textSize);
+            mis->itemWidth = textSize.cx + 38;
+            mis->itemHeight = (textSize.cy + 10 > 26) ? (textSize.cy + 10) : 26;
+            SelectObject(hdc, hOldFont);
+            ReleaseDC(m_hWnd, hdc);
+            return TRUE;
+        }
 
     case WM_DRAWITEM:
         {
             DRAWITEMSTRUCT* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
-            if (!dis || dis->CtlType != ODT_BUTTON) {
+            if (!dis) {
+                break;
+            }
+
+            if (dis->CtlType == ODT_MENU) {
+                if (dis->itemID == ID_MENU_HELP_SEPARATOR) {
+                    HBRUSH hBgBrush = CreateSolidBrush(RGB(45, 45, 45));
+                    FillRect(dis->hDC, &dis->rcItem, hBgBrush);
+                    DeleteObject(hBgBrush);
+
+                    HPEN hPen = CreatePen(PS_SOLID, 1, RGB(95, 95, 95));
+                    HPEN hOldPen = static_cast<HPEN>(SelectObject(dis->hDC, hPen));
+                    const int y = dis->rcItem.top + ((dis->rcItem.bottom - dis->rcItem.top) / 2);
+                    const int padding = 12;
+                    MoveToEx(dis->hDC, dis->rcItem.left + padding, y, nullptr);
+                    LineTo(dis->hDC, dis->rcItem.right - padding, y);
+                    SelectObject(dis->hDC, hOldPen);
+                    DeleteObject(hPen);
+                    return TRUE;
+                }
+
+                const wchar_t* text = GetMenuItemText(dis->itemID, dis->itemData);
+                if (text) {
+                    const bool isSelected = (dis->itemState & ODS_SELECTED) != 0;
+                    const bool isDisabled = (dis->itemState & ODS_DISABLED) != 0;
+
+                    HBRUSH hBgBrush = CreateSolidBrush(isSelected ? RGB(68, 68, 68) : RGB(45, 45, 45));
+                    FillRect(dis->hDC, &dis->rcItem, hBgBrush);
+                    DeleteObject(hBgBrush);
+
+                    if (isSelected) {
+                        HPEN hPen = CreatePen(PS_SOLID, 1, RGB(85, 85, 85));
+                        HPEN hOldPen = static_cast<HPEN>(SelectObject(dis->hDC, hPen));
+                        HBRUSH hOldBrush = static_cast<HBRUSH>(SelectObject(dis->hDC, GetStockObject(NULL_BRUSH)));
+                        Rectangle(dis->hDC, dis->rcItem.left, dis->rcItem.top, dis->rcItem.right, dis->rcItem.bottom);
+                        SelectObject(dis->hDC, hOldBrush);
+                        SelectObject(dis->hDC, hOldPen);
+                        DeleteObject(hPen);
+                    }
+
+                    HFONT hMenuFont = m_hFont ? m_hFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+                    HFONT hOldFont = static_cast<HFONT>(SelectObject(dis->hDC, hMenuFont));
+                    SetBkMode(dis->hDC, TRANSPARENT);
+                    SetTextColor(dis->hDC, isDisabled ? RGB(150, 150, 150) : RGB(255, 255, 255));
+
+                    RECT textRect = dis->rcItem;
+                    textRect.left += 14;
+                    DrawTextW(dis->hDC, text, -1, &textRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+                    SelectObject(dis->hDC, hOldFont);
+                    return TRUE;
+                }
+                break;
+            }
+
+            if (dis->CtlType != ODT_BUTTON) {
                 break;
             }
 
             if (dis->CtlID == ID_REGEX_CHECKBOX || dis->CtlID == ID_IGNORE_CASE_CHECKBOX) {
                 wchar_t text[256] = {};
-                GetWindowText(dis->hwndItem, text, 256);
+                GetWindowTextW(dis->hwndItem, text, 256);
                 const bool isPressed = m_pressedControl == dis->hwndItem || (dis->itemState & ODS_SELECTED) != 0;
                 const bool hasFocus = (dis->itemState & ODS_FOCUS) != 0;
                 const bool enabled = (dis->itemState & ODS_DISABLED) == 0;
@@ -358,7 +520,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             }
 
             wchar_t text[256] = {};
-            GetWindowText(dis->hwndItem, text, 256);
+            GetWindowTextW(dis->hwndItem, text, 256);
             const bool isPressed = m_pressedControl == dis->hwndItem || (dis->itemState & ODS_SELECTED) != 0;
             float hoverAlpha = 0.0f;
             auto hoverIt = m_buttonHoverAlpha.find(dis->hwndItem);
@@ -409,6 +571,8 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 m_pressedControl = m_hBrowseButton;
             } else if (IsPointInControl(m_hRenameButton, pt)) {
                 m_pressedControl = m_hRenameButton;
+            } else if (IsPointInControl(m_hHelpButton, pt)) {
+                m_pressedControl = m_hHelpButton;
             } else if (IsPointInControl(m_hRegexCheckbox, pt)) {
                 m_pressedControl = m_hRegexCheckbox;
             } else if (IsPointInControl(m_hIgnoreCaseCheckbox, pt)) {
@@ -675,6 +839,21 @@ void Application::CreateControls() {
         nullptr
     );
 
+    m_hHelpButton = CreateWindowEx(
+        0,
+        L"BUTTON",
+        L"Справка",
+        WS_VISIBLE | WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+        0,
+        0,
+        0,
+        0,
+        m_hWnd,
+        reinterpret_cast<HMENU>(ID_HELP_BUTTON),
+        m_hInstance,
+        nullptr
+    );
+
     m_hStatusLabel = CreateWindowEx(
         0,
         L"STATIC",
@@ -767,6 +946,29 @@ void Application::CreateControls() {
 
     m_buttonHoverAlpha[m_hBrowseButton] = 0.0f;
     m_buttonHoverAlpha[m_hRenameButton] = 0.0f;
+    m_buttonHoverAlpha[m_hHelpButton] = 0.0f;
+}
+
+void Application::CreateHelpMenu() {
+    if (m_hHelpMenu) {
+        DestroyMenu(m_hHelpMenu);
+        m_hHelpMenu = nullptr;
+    }
+
+    m_hHelpMenu = CreatePopupMenu();
+    if (!m_hHelpMenu) {
+        return;
+    }
+
+    AppendMenuW(m_hHelpMenu, MF_OWNERDRAW, ID_MENU_HELP_HOTKEYS, GetMenuItemText(ID_MENU_HELP_HOTKEYS, 0));
+    AppendMenuW(m_hHelpMenu, MF_OWNERDRAW, ID_MENU_HELP_SEPARATOR, L"");
+    AppendMenuW(m_hHelpMenu, MF_OWNERDRAW, ID_MENU_HELP_ABOUT, GetMenuItemText(ID_MENU_HELP_ABOUT, 0));
+
+    MENUINFO popupMenuInfo = {};
+    popupMenuInfo.cbSize = sizeof(MENUINFO);
+    popupMenuInfo.fMask = MIM_BACKGROUND;
+    popupMenuInfo.hbrBack = m_hCardBrush;
+    SetMenuInfo(m_hHelpMenu, &popupMenuInfo);
 }
 
 void Application::OnResize(int width, int height) {
@@ -779,7 +981,7 @@ void Application::OnResize(int width, int height) {
     const int cardGap = 12;
 
     const int formCardTop = outerMargin;
-    const int formCardHeight = 220;
+    const int formCardHeight = 250;
     const int formCardBottom = formCardTop + formCardHeight;
     const int previewCardTop = formCardBottom + cardGap;
     const int previewCardBottom = height - outerMargin;
@@ -810,8 +1012,9 @@ void Application::OnResize(int width, int height) {
     MoveWindow(m_hRegexCheckbox, controlLeft, actionRowY, 210, 26, TRUE);
     MoveWindow(m_hIgnoreCaseCheckbox, controlLeft + 216, actionRowY, 220, 26, TRUE);
     MoveWindow(m_hRenameButton, contentRight - 155, actionRowY - 1, 155, 30, TRUE);
+    MoveWindow(m_hHelpButton, contentRight - 155, actionRowY + 34, 155, 28, TRUE);
 
-    MoveWindow(m_hStatusLabel, contentLeft, actionRowY + 36, contentRight - contentLeft, 22, TRUE);
+    MoveWindow(m_hStatusLabel, contentLeft, actionRowY + 68, contentRight - contentLeft, 22, TRUE);
 
     const int previewInnerLeft = outerMargin + cardPadding;
     const int previewInnerRight = width - outerMargin - cardPadding;
@@ -841,7 +1044,7 @@ void Application::OnPaint() {
     UiRenderer::DrawBackground(hdc, clientRect);
 
     const int outerMargin = 12;
-    const int formCardHeight = 220;
+    const int formCardHeight = 250;
     const int formCardTop = outerMargin;
     const int formCardBottom = formCardTop + formCardHeight;
     const int previewCardTop = formCardBottom + 12;
@@ -900,9 +1103,755 @@ void Application::OnCommand(UINT controlId, UINT notifyCode) {
         RenameFiles();
         break;
 
+    case ID_HELP_BUTTON:
+        ShowHelpMenu();
+        break;
+
     default:
         break;
     }
+}
+
+void Application::OnMenuCommand(UINT menuId) {
+    switch (menuId) {
+    case ID_MENU_HELP_HOTKEYS:
+        ShowHotkeysWindow();
+        break;
+    case ID_MENU_HELP_ABOUT:
+        ShowAboutWindow();
+        break;
+    default:
+        break;
+    }
+}
+
+bool Application::RegisterInfoWindowClass() {
+    if (m_infoWindowClassRegistered) {
+        return true;
+    }
+
+    WNDCLASSEX wcex = {};
+    wcex.cbSize = sizeof(wcex);
+    wcex.style = CS_HREDRAW | CS_VREDRAW;
+    wcex.lpfnWndProc = InfoWindowProc;
+    wcex.hInstance = m_hInstance;
+    wcex.hIcon = LoadIcon(m_hInstance, MAKEINTRESOURCE(IDI_MAIN_ICON));
+    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wcex.hbrBackground = nullptr;
+    wcex.lpszClassName = INFO_WINDOW_CLASS_NAME;
+    wcex.hIconSm = LoadIcon(m_hInstance, MAKEINTRESOURCE(IDI_MAIN_ICON));
+
+    if (!RegisterClassEx(&wcex) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return false;
+    }
+
+    m_infoWindowClassRegistered = true;
+    return true;
+}
+
+bool Application::RegisterMessageWindowClass() {
+    if (m_messageWindowClassRegistered) {
+        return true;
+    }
+
+    WNDCLASSEX wcex = {};
+    wcex.cbSize = sizeof(wcex);
+    wcex.style = CS_HREDRAW | CS_VREDRAW;
+    wcex.lpfnWndProc = MessageWindowProc;
+    wcex.hInstance = m_hInstance;
+    wcex.hIcon = LoadIcon(m_hInstance, MAKEINTRESOURCE(IDI_MAIN_ICON));
+    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wcex.hbrBackground = nullptr;
+    wcex.lpszClassName = MESSAGE_WINDOW_CLASS_NAME;
+    wcex.hIconSm = LoadIcon(m_hInstance, MAKEINTRESOURCE(IDI_MAIN_ICON));
+
+    if (!RegisterClassEx(&wcex) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return false;
+    }
+
+    m_messageWindowClassRegistered = true;
+    return true;
+}
+
+void Application::ShowHelpMenu() {
+    if (!m_hHelpMenu || !m_hHelpButton || !IsWindow(m_hHelpButton)) {
+        return;
+    }
+
+    RECT buttonRect = {};
+    GetWindowRect(m_hHelpButton, &buttonRect);
+
+    SetForegroundWindow(m_hWnd);
+    TrackPopupMenu(
+        m_hHelpMenu,
+        TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON,
+        buttonRect.left,
+        buttonRect.bottom + 2,
+        0,
+        m_hWnd,
+        nullptr
+    );
+    PostMessage(m_hWnd, WM_NULL, 0, 0);
+}
+
+void Application::ShowHotkeysWindow() {
+    const std::wstring hotkeysText =
+        L"Горячие клавиши:\r\n\r\n"
+        L"Tab\t— открыть выбор папки\r\n"
+        L"Enter\t— запустить переименование\r\n"
+        L"Esc\t— снять фокус с поля ввода\r\n"
+        L"Down\t— из поля Паттерн перейти в Шаблон замены\r\n"
+        L"Up\t— из поля Шаблон замены перейти в Паттерн\r\n"
+        L"Буква/цифра вне полей\t— фокус в Паттерн и ввод символа";
+
+    CreateOrActivateInfoWindow(
+        InfoWindowKind::Hotkeys,
+        m_hHotkeysWindow,
+        GetMenuItemText(ID_MENU_HELP_HOTKEYS, 0),
+        hotkeysText
+    );
+}
+
+void Application::ShowAboutWindow() {
+    std::wstring aboutText;
+    aboutText.reserve(256);
+    aboutText += L"FileRenamer\r\n";
+    aboutText += L"Версия: ";
+    aboutText += APP_VERSION;
+    aboutText += L"\r\n";
+    aboutText += L"Автор: laynholt\r\n\r\n";
+    aboutText += L"Приложение для массового переименования файлов и папок ";
+    aboutText += L"по строке или regex с предпросмотром результата.";
+
+    CreateOrActivateInfoWindow(
+        InfoWindowKind::About,
+        m_hAboutWindow,
+        GetMenuItemText(ID_MENU_HELP_ABOUT, 0),
+        aboutText
+    );
+}
+
+void Application::CreateOrActivateInfoWindow(InfoWindowKind kind, HWND& targetHandle, const wchar_t* title, const std::wstring& bodyText) {
+    const wchar_t* effectiveTitle = title;
+    if (!effectiveTitle || effectiveTitle[0] == L'\0') {
+        const UINT menuItemId = (kind == InfoWindowKind::Hotkeys) ? ID_MENU_HELP_HOTKEYS : ID_MENU_HELP_ABOUT;
+        effectiveTitle = GetMenuItemText(menuItemId, 0);
+        if (!effectiveTitle) {
+            effectiveTitle = L"";
+        }
+    }
+
+    if (targetHandle && IsWindow(targetHandle)) {
+        SetWindowTextW(targetHandle, effectiveTitle);
+        ShowWindow(targetHandle, SW_SHOWNORMAL);
+        SetForegroundWindow(targetHandle);
+        return;
+    }
+
+    const int windowWidth = (kind == InfoWindowKind::Hotkeys) ? 640 : 520;
+    const int windowHeight = (kind == InfoWindowKind::Hotkeys) ? 360 : 300;
+
+    RECT parentRect = {};
+    GetWindowRect(m_hWnd, &parentRect);
+    int x = parentRect.left + ((parentRect.right - parentRect.left) - windowWidth) / 2;
+    int y = parentRect.top + ((parentRect.bottom - parentRect.top) - windowHeight) / 2;
+    if (x < 0) {
+        x = 40;
+    }
+    if (y < 0) {
+        y = 40;
+    }
+
+    auto* state = new InfoWindowState{
+        this,
+        static_cast<int>(kind),
+        nullptr,
+        nullptr,
+        nullptr,
+        bodyText,
+        m_hFont,
+        nullptr
+    };
+
+    targetHandle = CreateWindowEx(
+        WS_EX_DLGMODALFRAME,
+        INFO_WINDOW_CLASS_NAME,
+        effectiveTitle,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        x,
+        y,
+        windowWidth,
+        windowHeight,
+        m_hWnd,
+        nullptr,
+        m_hInstance,
+        state
+    );
+
+    if (!targetHandle) {
+        delete state;
+        SetStatusText(L"Не удалось открыть окно справки");
+        return;
+    }
+
+    ShowWindow(targetHandle, SW_SHOW);
+    UpdateWindow(targetHandle);
+}
+
+void Application::OnInfoWindowClosed(InfoWindowKind kind) {
+    if (kind == InfoWindowKind::Hotkeys) {
+        m_hHotkeysWindow = nullptr;
+    } else {
+        m_hAboutWindow = nullptr;
+    }
+}
+
+int Application::ShowStyledMessageDialog(const wchar_t* title,
+                                         const std::wstring& bodyText,
+                                         const wchar_t* primaryButtonText,
+                                         const wchar_t* secondaryButtonText) {
+    if (!m_hWnd || !IsWindow(m_hWnd)) {
+        return IDCANCEL;
+    }
+
+    if (!RegisterMessageWindowClass()) {
+        const UINT fallbackType = (secondaryButtonText && secondaryButtonText[0] != L'\0') ? MB_YESNO : MB_OK;
+        return MessageBoxW(m_hWnd, bodyText.c_str(), title ? title : L"", fallbackType | MB_ICONINFORMATION);
+    }
+
+    int result = IDCANCEL;
+    auto* state = new MessageWindowState{
+        this,
+        nullptr,
+        nullptr,
+        nullptr,
+        m_hFont,
+        nullptr,
+        bodyText,
+        (primaryButtonText && primaryButtonText[0] != L'\0') ? primaryButtonText : L"Закрыть",
+        (secondaryButtonText ? secondaryButtonText : L""),
+        (secondaryButtonText && secondaryButtonText[0] != L'\0'),
+        IDCANCEL,
+        &result
+    };
+
+    const int windowWidth = 560;
+    const int windowHeight = state->hasSecondaryButton ? 320 : 290;
+    RECT parentRect = {};
+    GetWindowRect(m_hWnd, &parentRect);
+    int x = parentRect.left + ((parentRect.right - parentRect.left) - windowWidth) / 2;
+    int y = parentRect.top + ((parentRect.bottom - parentRect.top) - windowHeight) / 2;
+    if (x < 0) {
+        x = 50;
+    }
+    if (y < 0) {
+        y = 50;
+    }
+
+    HWND dialogWindow = CreateWindowEx(
+        WS_EX_DLGMODALFRAME,
+        MESSAGE_WINDOW_CLASS_NAME,
+        (title && title[0] != L'\0') ? title : L"",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        x,
+        y,
+        windowWidth,
+        windowHeight,
+        m_hWnd,
+        nullptr,
+        m_hInstance,
+        state
+    );
+
+    if (!dialogWindow) {
+        const UINT fallbackType = state->hasSecondaryButton ? MB_YESNO : MB_OK;
+        delete state;
+        return MessageBoxW(m_hWnd, bodyText.c_str(), title ? title : L"", fallbackType | MB_ICONINFORMATION);
+    }
+
+    EnableWindow(m_hWnd, FALSE);
+    ShowWindow(dialogWindow, SW_SHOW);
+    UpdateWindow(dialogWindow);
+    SetForegroundWindow(dialogWindow);
+
+    MSG msg = {};
+    while (IsWindow(dialogWindow)) {
+        const BOOL getMessageResult = GetMessage(&msg, nullptr, 0, 0);
+        if (getMessageResult == -1) {
+            break;
+        }
+        if (getMessageResult == 0) {
+            PostQuitMessage(static_cast<int>(msg.wParam));
+            break;
+        }
+
+        if (!IsDialogMessage(dialogWindow, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+    }
+
+    EnableWindow(m_hWnd, TRUE);
+    SetForegroundWindow(m_hWnd);
+    SetFocus(m_hWnd);
+    return result;
+}
+
+void Application::ShowStyledMessage(const std::wstring& title, const std::wstring& message) {
+    ShowStyledMessageDialog(title.c_str(), message, L"ОК");
+}
+
+void Application::CheckForUpdates() {
+    const wchar_t* checkUpdatesTitle = L"Проверка обновлений";
+    const wchar_t* updateTitle = L"Обновление";
+
+    if (!m_updateService) {
+        m_updateService = std::make_unique<UpdateService>();
+    }
+    if (!m_updateService) {
+        ShowStyledMessageDialog(checkUpdatesTitle, L"Сервис обновлений не инициализирован", L"Закрыть");
+        return;
+    }
+
+    SetCursor(LoadCursor(nullptr, IDC_WAIT));
+    SetStatusText(L"Проверка обновлений...");
+    const UpdateCheckResult checkResult = m_updateService->CheckForUpdates(APP_VERSION);
+    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+
+    if (!checkResult.success) {
+        std::wstring message = L"Не удалось проверить обновления.\r\n\r\n";
+        message += checkResult.errorMessage;
+        ShowStyledMessageDialog(checkUpdatesTitle, message, L"Закрыть");
+        SetStatusText(L"Ошибка проверки обновлений");
+        return;
+    }
+
+    const std::wstring latestVersion = checkResult.latestVersion.empty() ? checkResult.latestTag : checkResult.latestVersion;
+    if (!checkResult.updateAvailable) {
+        std::wstring message = L"Установлена последняя версия приложения.";
+        if (!latestVersion.empty()) {
+            message += L"\r\n\r\nТекущая версия: ";
+            message += APP_VERSION;
+            message += L"\r\nПоследний релиз: ";
+            message += latestVersion;
+        }
+        ShowStyledMessageDialog(checkUpdatesTitle, message, L"Закрыть");
+        SetStatusText(L"Установлена последняя версия");
+        return;
+    }
+
+    std::wstring message = L"Доступна новая версия: ";
+    message += latestVersion.empty() ? checkResult.latestTag : latestVersion;
+    message += L"\r\nТекущая версия: ";
+    message += APP_VERSION;
+    message += L"\r\n\r\nСкачать и установить обновление сейчас?";
+
+    const int userDecision = ShowStyledMessageDialog(
+        checkUpdatesTitle,
+        message,
+        L"Скачать",
+        L"Отмена"
+    );
+
+    if (userDecision != IDYES) {
+        SetStatusText(L"Обновление отменено");
+        return;
+    }
+
+    wchar_t tempPath[MAX_PATH] = {};
+    const DWORD tempPathLength = GetTempPathW(MAX_PATH, tempPath);
+    if (tempPathLength == 0 || tempPathLength >= MAX_PATH) {
+        ShowStyledMessageDialog(updateTitle, L"Не удалось определить временную директорию", L"Закрыть");
+        SetStatusText(L"Ошибка загрузки обновления");
+        return;
+    }
+
+    std::wstring downloadedExePath = tempPath;
+    if (!downloadedExePath.empty() && downloadedExePath.back() != L'\\') {
+        downloadedExePath.push_back(L'\\');
+    }
+    downloadedExePath += L"FileRenamer_update.exe";
+
+    std::wstring downloadError;
+    SetCursor(LoadCursor(nullptr, IDC_WAIT));
+    SetStatusText(L"Загрузка обновления...");
+    const bool downloaded = m_updateService->DownloadReleaseExecutable(checkResult.latestTag, downloadedExePath, downloadError);
+    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+
+    if (!downloaded) {
+        std::wstring errorMessage = L"Не удалось скачать обновление.\r\n\r\n";
+        errorMessage += downloadError;
+        ShowStyledMessageDialog(updateTitle, errorMessage, L"Закрыть");
+        SetStatusText(L"Ошибка загрузки обновления");
+        return;
+    }
+
+    wchar_t currentExePath[MAX_PATH] = {};
+    const DWORD currentExePathLength = GetModuleFileNameW(nullptr, currentExePath, MAX_PATH);
+    if (currentExePathLength == 0 || currentExePathLength >= MAX_PATH) {
+        DeleteFileW(downloadedExePath.c_str());
+        ShowStyledMessageDialog(updateTitle, L"Не удалось определить путь текущего приложения", L"Закрыть");
+        SetStatusText(L"Ошибка обновления");
+        return;
+    }
+
+    std::wstring launchError;
+    if (!m_updateService->LaunchUpdaterProcess(GetCurrentProcessId(), downloadedExePath, currentExePath, launchError)) {
+        DeleteFileW(downloadedExePath.c_str());
+        std::wstring errorMessage = L"Не удалось запустить установку обновления.\r\n\r\n";
+        errorMessage += launchError;
+        ShowStyledMessageDialog(updateTitle, errorMessage, L"Закрыть");
+        SetStatusText(L"Ошибка обновления");
+        return;
+    }
+
+    SetStatusText(L"Обновление готово. Перезапуск...");
+    DestroyWindow(m_hWnd);
+}
+
+LRESULT CALLBACK Application::InfoWindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<InfoWindowState*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
+
+    switch (message) {
+    case WM_NCCREATE:
+        {
+            CREATESTRUCT* create = reinterpret_cast<CREATESTRUCT*>(lParam);
+            auto* initialState = reinterpret_cast<InfoWindowState*>(create->lpCreateParams);
+            SetWindowLongPtr(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(initialState));
+            return TRUE;
+        }
+
+    case WM_CREATE:
+        if (state) {
+            state->editBrush = CreateSolidBrush(RGB(45, 45, 45));
+            const InfoWindowKind infoKind = static_cast<InfoWindowKind>(state->kind);
+
+            state->textControl = CreateWindowEx(
+                0,
+                L"EDIT",
+                state->text.c_str(),
+                WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_WANTRETURN | ES_READONLY,
+                12, 12, 100, 100,
+                hWnd,
+                reinterpret_cast<HMENU>(ID_INFO_TEXT),
+                GetModuleHandle(nullptr),
+                nullptr
+            );
+
+            state->closeButton = CreateWindowEx(
+                0,
+                L"BUTTON",
+                L"Закрыть",
+                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | BS_OWNERDRAW | WS_TABSTOP,
+                12, 12, 120, 30,
+                hWnd,
+                reinterpret_cast<HMENU>(ID_INFO_CLOSE),
+                GetModuleHandle(nullptr),
+                nullptr
+            );
+
+            if (infoKind == InfoWindowKind::About) {
+                state->checkUpdatesButton = CreateWindowEx(
+                    0,
+                    L"BUTTON",
+                    L"Проверить обновления",
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                    12, 12, 210, 30,
+                    hWnd,
+                    reinterpret_cast<HMENU>(ID_INFO_CHECK_UPDATES),
+                    GetModuleHandle(nullptr),
+                    nullptr
+                );
+            }
+
+            if (state->font) {
+                SendMessage(state->textControl, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), MAKELPARAM(FALSE, 0));
+                SendMessage(state->closeButton, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), MAKELPARAM(FALSE, 0));
+                if (state->checkUpdatesButton) {
+                    SendMessage(state->checkUpdatesButton, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), MAKELPARAM(FALSE, 0));
+                }
+            }
+        }
+        return 0;
+
+    case WM_SIZE:
+        if (state) {
+            const int width = LOWORD(lParam);
+            const int height = HIWORD(lParam);
+            const int margin = 20;
+            const int buttonWidth = 120;
+            const int buttonHeight = 30;
+            const int checkUpdatesWidth = 210;
+
+            MoveWindow(state->textControl, margin, margin, width - (margin * 2), height - (margin * 3) - buttonHeight, TRUE);
+            MoveWindow(state->closeButton, width - margin - buttonWidth, height - margin - buttonHeight, buttonWidth, buttonHeight, TRUE);
+            if (state->checkUpdatesButton) {
+                MoveWindow(state->checkUpdatesButton, margin, height - margin - buttonHeight, checkUpdatesWidth, buttonHeight, TRUE);
+            }
+        }
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+        {
+            PAINTSTRUCT ps = {};
+            HDC hdc = BeginPaint(hWnd, &ps);
+
+            RECT clientRect = {};
+            GetClientRect(hWnd, &clientRect);
+            UiRenderer::DrawBackground(hdc, clientRect);
+
+            RECT cardRect = {8, 8, clientRect.right - 8, clientRect.bottom - 8};
+            UiRenderer::DrawCard(hdc, cardRect);
+
+            EndPaint(hWnd, &ps);
+
+            if (state && state->textControl) {
+                UiRenderer::DrawEditBorder(hWnd, state->textControl);
+            }
+        }
+        return 0;
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        if (state && state->editBrush) {
+            HDC hdcControl = reinterpret_cast<HDC>(wParam);
+            SetTextColor(hdcControl, RGB(255, 255, 255));
+            SetBkColor(hdcControl, RGB(45, 45, 45));
+            return reinterpret_cast<INT_PTR>(state->editBrush);
+        }
+        break;
+
+    case WM_DRAWITEM:
+        {
+            DRAWITEMSTRUCT* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+            if (dis && dis->CtlType == ODT_BUTTON &&
+                (dis->CtlID == ID_INFO_CLOSE || dis->CtlID == ID_INFO_CHECK_UPDATES)) {
+                wchar_t buttonText[128] = {};
+                GetWindowTextW(dis->hwndItem, buttonText, 128);
+                const bool isPressed = (dis->itemState & ODS_SELECTED) != 0;
+                const float hoverAlpha = (dis->itemState & ODS_HOTLIGHT) ? 1.0f : 0.0f;
+                UiRenderer::DrawCustomButton(dis->hDC, dis->hwndItem, buttonText, isPressed, hoverAlpha);
+                return TRUE;
+            }
+        }
+        break;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == ID_INFO_CHECK_UPDATES && state && state->owner) {
+            state->owner->CheckForUpdates();
+            return 0;
+        }
+        if (LOWORD(wParam) == ID_INFO_CLOSE || LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
+            DestroyWindow(hWnd);
+            return 0;
+        }
+        break;
+
+    case WM_CLOSE:
+        DestroyWindow(hWnd);
+        return 0;
+
+    case WM_NCDESTROY:
+        if (state) {
+            if (state->editBrush) {
+                DeleteObject(state->editBrush);
+                state->editBrush = nullptr;
+            }
+            if (state->owner) {
+                state->owner->OnInfoWindowClosed(static_cast<InfoWindowKind>(state->kind));
+            }
+            delete state;
+            SetWindowLongPtr(hWnd, GWLP_USERDATA, 0);
+        }
+        return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+
+    return DefWindowProc(hWnd, message, wParam, lParam);
+}
+
+LRESULT CALLBACK Application::MessageWindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<MessageWindowState*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
+
+    switch (message) {
+    case WM_NCCREATE:
+        {
+            CREATESTRUCT* create = reinterpret_cast<CREATESTRUCT*>(lParam);
+            auto* initialState = reinterpret_cast<MessageWindowState*>(create->lpCreateParams);
+            SetWindowLongPtr(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(initialState));
+            return TRUE;
+        }
+
+    case WM_CREATE:
+        if (state) {
+            state->editBrush = CreateSolidBrush(RGB(45, 45, 45));
+            state->textControl = CreateWindowEx(
+                0,
+                L"EDIT",
+                state->text.c_str(),
+                WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_WANTRETURN | ES_READONLY,
+                12, 12, 100, 100,
+                hWnd,
+                reinterpret_cast<HMENU>(ID_MESSAGE_TEXT),
+                GetModuleHandle(nullptr),
+                nullptr
+            );
+
+            state->primaryButton = CreateWindowEx(
+                0,
+                L"BUTTON",
+                state->primaryButtonText.c_str(),
+                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | BS_OWNERDRAW | WS_TABSTOP,
+                12, 12, 140, 32,
+                hWnd,
+                reinterpret_cast<HMENU>(ID_MESSAGE_PRIMARY),
+                GetModuleHandle(nullptr),
+                nullptr
+            );
+
+            if (state->hasSecondaryButton) {
+                state->secondaryButton = CreateWindowEx(
+                    0,
+                    L"BUTTON",
+                    state->secondaryButtonText.c_str(),
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                    12, 12, 140, 32,
+                    hWnd,
+                    reinterpret_cast<HMENU>(ID_MESSAGE_SECONDARY),
+                    GetModuleHandle(nullptr),
+                    nullptr
+                );
+            }
+
+            if (state->font) {
+                SendMessage(state->textControl, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), MAKELPARAM(FALSE, 0));
+                SendMessage(state->primaryButton, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), MAKELPARAM(FALSE, 0));
+                if (state->secondaryButton) {
+                    SendMessage(state->secondaryButton, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), MAKELPARAM(FALSE, 0));
+                }
+            }
+        }
+        return 0;
+
+    case WM_SIZE:
+        if (state) {
+            const int width = LOWORD(lParam);
+            const int height = HIWORD(lParam);
+            const int margin = 20;
+            const int buttonWidth = 140;
+            const int buttonHeight = 32;
+            const int buttonGap = 10;
+
+            MoveWindow(
+                state->textControl,
+                margin,
+                margin,
+                width - (margin * 2),
+                height - (margin * 3) - buttonHeight,
+                TRUE
+            );
+
+            const int buttonY = height - margin - buttonHeight;
+            if (state->hasSecondaryButton && state->secondaryButton) {
+                const int primaryX = width - margin - buttonWidth;
+                const int secondaryX = primaryX - buttonGap - buttonWidth;
+                MoveWindow(state->secondaryButton, secondaryX, buttonY, buttonWidth, buttonHeight, TRUE);
+                MoveWindow(state->primaryButton, primaryX, buttonY, buttonWidth, buttonHeight, TRUE);
+            } else {
+                MoveWindow(state->primaryButton, width - margin - buttonWidth, buttonY, buttonWidth, buttonHeight, TRUE);
+            }
+        }
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+        {
+            PAINTSTRUCT ps = {};
+            HDC hdc = BeginPaint(hWnd, &ps);
+
+            RECT clientRect = {};
+            GetClientRect(hWnd, &clientRect);
+            UiRenderer::DrawBackground(hdc, clientRect);
+
+            RECT cardRect = {8, 8, clientRect.right - 8, clientRect.bottom - 8};
+            UiRenderer::DrawCard(hdc, cardRect);
+
+            EndPaint(hWnd, &ps);
+
+            if (state && state->textControl) {
+                UiRenderer::DrawEditBorder(hWnd, state->textControl);
+            }
+        }
+        return 0;
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        if (state && state->editBrush) {
+            HDC hdcControl = reinterpret_cast<HDC>(wParam);
+            SetTextColor(hdcControl, RGB(255, 255, 255));
+            SetBkColor(hdcControl, RGB(45, 45, 45));
+            return reinterpret_cast<INT_PTR>(state->editBrush);
+        }
+        break;
+
+    case WM_DRAWITEM:
+        {
+            DRAWITEMSTRUCT* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+            if (dis && dis->CtlType == ODT_BUTTON &&
+                (dis->CtlID == ID_MESSAGE_PRIMARY || dis->CtlID == ID_MESSAGE_SECONDARY)) {
+                wchar_t buttonText[128] = {};
+                GetWindowTextW(dis->hwndItem, buttonText, 128);
+                const bool isPressed = (dis->itemState & ODS_SELECTED) != 0;
+                const float hoverAlpha = (dis->itemState & ODS_HOTLIGHT) ? 1.0f : 0.0f;
+                UiRenderer::DrawCustomButton(dis->hDC, dis->hwndItem, buttonText, isPressed, hoverAlpha);
+                return TRUE;
+            }
+        }
+        break;
+
+    case WM_COMMAND:
+        if (state) {
+            const UINT commandId = LOWORD(wParam);
+            if (commandId == ID_MESSAGE_PRIMARY || commandId == IDOK) {
+                state->result = state->hasSecondaryButton ? IDYES : IDOK;
+                DestroyWindow(hWnd);
+                return 0;
+            }
+            if (commandId == ID_MESSAGE_SECONDARY || commandId == IDCANCEL) {
+                state->result = state->hasSecondaryButton ? IDNO : IDCANCEL;
+                DestroyWindow(hWnd);
+                return 0;
+            }
+        }
+        break;
+
+    case WM_CLOSE:
+        if (state) {
+            state->result = state->hasSecondaryButton ? IDNO : IDCANCEL;
+        }
+        DestroyWindow(hWnd);
+        return 0;
+
+    case WM_NCDESTROY:
+        if (state) {
+            if (state->editBrush) {
+                DeleteObject(state->editBrush);
+                state->editBrush = nullptr;
+            }
+            if (state->resultOut) {
+                *state->resultOut = state->result;
+            }
+            delete state;
+            SetWindowLongPtr(hWnd, GWLP_USERDATA, 0);
+        }
+        return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+
+    return DefWindowProc(hWnd, message, wParam, lParam);
 }
 
 void Application::UpdatePreview() {
@@ -1056,236 +2005,6 @@ void Application::SyncFolderFromExplorer() {
     }
 }
 
-bool Application::RegisterStyledDialogClass() {
-    if (m_styledDialogClassRegistered) {
-        return true;
-    }
-
-    WNDCLASSEX wcex = {};
-    wcex.cbSize = sizeof(wcex);
-    wcex.style = CS_HREDRAW | CS_VREDRAW;
-    wcex.lpfnWndProc = StyledDialogProc;
-    wcex.hInstance = m_hInstance;
-    wcex.hIcon = LoadIcon(m_hInstance, MAKEINTRESOURCE(IDI_MAIN_ICON));
-    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground = nullptr;
-    wcex.lpszClassName = STYLED_DIALOG_CLASS_NAME;
-    wcex.hIconSm = LoadIcon(m_hInstance, MAKEINTRESOURCE(IDI_MAIN_ICON));
-
-    if (!RegisterClassEx(&wcex) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        return false;
-    }
-
-    m_styledDialogClassRegistered = true;
-    return true;
-}
-
-void Application::ShowStyledMessage(const std::wstring& title, const std::wstring& message) {
-    if (!RegisterStyledDialogClass()) {
-        MessageBox(m_hWnd, message.c_str(), title.c_str(), MB_OK | MB_ICONINFORMATION);
-        return;
-    }
-
-    const int dialogWidth = 520;
-    const int dialogHeight = 280;
-
-    RECT parentRect = {};
-    GetWindowRect(m_hWnd, &parentRect);
-    const int x = parentRect.left + ((parentRect.right - parentRect.left) - dialogWidth) / 2;
-    const int y = parentRect.top + ((parentRect.bottom - parentRect.top) - dialogHeight) / 2;
-
-    auto* state = new StyledDialogState{
-        this,
-        message,
-        m_hFont,
-        nullptr,
-        nullptr,
-        nullptr
-    };
-
-    EnableWindow(m_hWnd, FALSE);
-
-    HWND dialog = CreateWindowEx(
-        WS_EX_DLGMODALFRAME,
-        STYLED_DIALOG_CLASS_NAME,
-        title.c_str(),
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        x,
-        y,
-        dialogWidth,
-        dialogHeight,
-        m_hWnd,
-        nullptr,
-        m_hInstance,
-        state
-    );
-
-    if (!dialog) {
-        EnableWindow(m_hWnd, TRUE);
-        delete state;
-        MessageBox(m_hWnd, message.c_str(), title.c_str(), MB_OK | MB_ICONINFORMATION);
-        return;
-    }
-
-    ShowWindow(dialog, SW_SHOW);
-    UpdateWindow(dialog);
-    SetForegroundWindow(dialog);
-
-    MSG msg = {};
-    BOOL getMessageResult = TRUE;
-    while (IsWindow(dialog) && (getMessageResult = GetMessage(&msg, nullptr, 0, 0)) != 0) {
-        if (!IsDialogMessage(dialog, &msg)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-    }
-
-    EnableWindow(m_hWnd, TRUE);
-    SetForegroundWindow(m_hWnd);
-    SetFocus(m_hWnd);
-
-    if (getMessageResult == 0) {
-        PostQuitMessage(static_cast<int>(msg.wParam));
-    }
-}
-
-LRESULT CALLBACK Application::StyledDialogProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    auto* state = reinterpret_cast<StyledDialogState*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
-
-    switch (message) {
-    case WM_NCCREATE:
-        {
-            CREATESTRUCT* create = reinterpret_cast<CREATESTRUCT*>(lParam);
-            auto* initialState = reinterpret_cast<StyledDialogState*>(create->lpCreateParams);
-            SetWindowLongPtr(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(initialState));
-            return TRUE;
-        }
-
-    case WM_CREATE:
-        if (state) {
-            state->editBrush = CreateSolidBrush(RGB(45, 45, 45));
-
-            state->textControl = CreateWindowEx(
-                0,
-                L"EDIT",
-                state->message.c_str(),
-                WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-                16,
-                16,
-                100,
-                100,
-                hWnd,
-                reinterpret_cast<HMENU>(ID_STYLED_DIALOG_TEXT),
-                GetModuleHandle(nullptr),
-                nullptr
-            );
-
-            state->okButton = CreateWindowEx(
-                0,
-                L"BUTTON",
-                L"OK",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON | BS_OWNERDRAW,
-                16,
-                16,
-                120,
-                32,
-                hWnd,
-                reinterpret_cast<HMENU>(ID_STYLED_DIALOG_OK),
-                GetModuleHandle(nullptr),
-                nullptr
-            );
-
-            if (state->font) {
-                SendMessage(state->textControl, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), MAKELPARAM(FALSE, 0));
-                SendMessage(state->okButton, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), MAKELPARAM(FALSE, 0));
-            }
-        }
-        return 0;
-
-    case WM_SIZE:
-        if (state) {
-            const int width = LOWORD(lParam);
-            const int height = HIWORD(lParam);
-            const int margin = 20;
-            const int buttonWidth = 120;
-            const int buttonHeight = 32;
-
-            MoveWindow(state->textControl, margin, margin, width - (margin * 2), height - (margin * 3) - buttonHeight, TRUE);
-            MoveWindow(state->okButton, width - margin - buttonWidth, height - margin - buttonHeight, buttonWidth, buttonHeight, TRUE);
-        }
-        return 0;
-
-    case WM_ERASEBKGND:
-        return 1;
-
-    case WM_PAINT:
-        {
-            PAINTSTRUCT ps = {};
-            HDC hdc = BeginPaint(hWnd, &ps);
-
-            RECT clientRect = {};
-            GetClientRect(hWnd, &clientRect);
-            UiRenderer::DrawBackground(hdc, clientRect);
-
-            RECT cardRect = {8, 8, clientRect.right - 8, clientRect.bottom - 8};
-            UiRenderer::DrawCard(hdc, cardRect);
-
-            EndPaint(hWnd, &ps);
-
-            if (state && state->textControl) {
-                UiRenderer::DrawEditBorder(hWnd, state->textControl);
-            }
-        }
-        return 0;
-
-    case WM_CTLCOLORSTATIC:
-    case WM_CTLCOLOREDIT:
-        if (state && state->editBrush) {
-            HDC hdcControl = reinterpret_cast<HDC>(wParam);
-            SetTextColor(hdcControl, RGB(243, 244, 246));
-            SetBkColor(hdcControl, RGB(45, 45, 45));
-            return reinterpret_cast<INT_PTR>(state->editBrush);
-        }
-        break;
-
-    case WM_DRAWITEM:
-        {
-            DRAWITEMSTRUCT* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
-            if (dis && dis->CtlType == ODT_BUTTON && dis->CtlID == ID_STYLED_DIALOG_OK) {
-                const bool isPressed = (dis->itemState & ODS_SELECTED) != 0;
-                const float hoverAlpha = (dis->itemState & ODS_HOTLIGHT) ? 1.0f : 0.0f;
-                UiRenderer::DrawCustomButton(dis->hDC, dis->hwndItem, L"OK", isPressed, hoverAlpha);
-                return TRUE;
-            }
-        }
-        break;
-
-    case WM_COMMAND:
-        if (LOWORD(wParam) == ID_STYLED_DIALOG_OK || LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
-            DestroyWindow(hWnd);
-            return 0;
-        }
-        break;
-
-    case WM_CLOSE:
-        DestroyWindow(hWnd);
-        return 0;
-
-    case WM_NCDESTROY:
-        if (state) {
-            if (state->editBrush) {
-                DeleteObject(state->editBrush);
-                state->editBrush = nullptr;
-            }
-            delete state;
-            SetWindowLongPtr(hWnd, GWLP_USERDATA, 0);
-        }
-        return DefWindowProc(hWnd, message, wParam, lParam);
-    }
-
-    return DefWindowProc(hWnd, message, wParam, lParam);
-}
-
 std::wstring Application::GetEditText(HWND control) const {
     if (!control) {
         return L"";
@@ -1321,6 +2040,8 @@ void Application::UpdateHoverState(POINT clientPoint) {
         hovered = m_hBrowseButton;
     } else if (IsPointInControl(m_hRenameButton, clientPoint)) {
         hovered = m_hRenameButton;
+    } else if (IsPointInControl(m_hHelpButton, clientPoint)) {
+        hovered = m_hHelpButton;
     } else if (IsPointInControl(m_hRegexCheckbox, clientPoint)) {
         hovered = m_hRegexCheckbox;
     } else if (IsPointInControl(m_hIgnoreCaseCheckbox, clientPoint)) {
