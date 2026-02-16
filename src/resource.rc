@@ -4,8 +4,8 @@
 IDI_MAIN_ICON ICON "../assets/icon.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION 1,0,2,0
+PRODUCTVERSION 1,0,2,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -18,12 +18,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "laynholt"
             VALUE "FileDescription", "File Renamer"
-            VALUE "FileVersion", "1.0.0.0"
+            VALUE "FileVersion", "1.0.2.0"
             VALUE "InternalName", "FileRenamer"
             VALUE "LegalCopyright", "Copyright (C) 2026"
             VALUE "OriginalFilename", "FileRenamer.exe"
             VALUE "ProductName", "File Renamer"
-            VALUE "ProductVersion", "1.0.0.0"
+            VALUE "ProductVersion", "1.0.2.0"
         END
     END
     BLOCK "VarFileInfo"

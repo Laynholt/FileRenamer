@@ -4,7 +4,6 @@
 #include <objbase.h>
 
 #include <algorithm>
-#include <cctype>
 #include <cwctype>
 #include <optional>
 #include <regex>

@@ -5,13 +5,13 @@
 #include <map>
 #include <string>
 
-class Tooltil {
+class ToolTip {
 public:
-    Tooltil();
-    ~Tooltil();
+    ToolTip();
+    ~ToolTip();
 
-    Tooltil(const Tooltil&) = delete;
-    Tooltil& operator=(const Tooltil&) = delete;
+    ToolTip(const ToolTip&) = delete;
+    ToolTip& operator=(const ToolTip&) = delete;
 
     bool Initialize(HWND ownerWindow);
     void SetStyle(HFONT font, COLORREF backgroundColor, COLORREF textColor) const;

@@ -3,18 +3,18 @@
 
 #include "ExplorerPathProvider.h"
 #include "RenamerService.h"
-#include "Tooltil.h"
+#include "ToolTip.h"
 #include "UiRenderer.h"
 #include "UpdateService.h"
 #include "resource.h"
 
 #include <windowsx.h>
 #include <commctrl.h>
+#include <gdiplus.h>
 #include <objbase.h>
 #include <shobjidl.h>
 
 #include <algorithm>
-#include <cctype>
 #include <cwctype>
 #include <filesystem>
 
@@ -966,7 +966,7 @@ void Application::CreateControls() {
     m_buttonHoverAlpha[m_hRenameButton] = 0.0f;
     m_buttonHoverAlpha[m_hHelpButton] = 0.0f;
 
-    m_tooltil = std::make_unique<Tooltil>();
+    m_tooltil = std::make_unique<ToolTip>();
     if (m_tooltil->Initialize(m_hWnd)) {
         m_tooltil->SetStyle(m_hFont, RGB(45, 45, 45), RGB(235, 235, 235));
 

@@ -18,11 +18,8 @@ int APIENTRY wWinMain(
     }
 
     HWND hWnd = app.GetMainWindow();
-    SetWindowTextW(hWnd, Application::WINDOW_TITLE);
     ShowWindow(hWnd, nCmdShow == SW_SHOWMINIMIZED ? SW_SHOWNORMAL : nCmdShow);
     UpdateWindow(hWnd);
 
-    const int result = app.Run();
-    app.Shutdown();
-    return result;
+    return app.Run();
 }

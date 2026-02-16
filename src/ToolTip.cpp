@@ -1,16 +1,16 @@
-#include "Tooltil.h"
+#include "ToolTip.h"
 
 #include <commctrl.h>
 
-Tooltil::Tooltil()
+ToolTip::ToolTip()
     : m_hToolTip(nullptr) {
 }
 
-Tooltil::~Tooltil() {
+ToolTip::~ToolTip() {
     Destroy();
 }
 
-bool Tooltil::Initialize(HWND ownerWindow) {
+bool ToolTip::Initialize(HWND ownerWindow) {
     if (!ownerWindow || !IsWindow(ownerWindow)) {
         return false;
     }
@@ -44,7 +44,7 @@ bool Tooltil::Initialize(HWND ownerWindow) {
     return true;
 }
 
-void Tooltil::SetStyle(HFONT font, COLORREF backgroundColor, COLORREF textColor) const {
+void ToolTip::SetStyle(HFONT font, COLORREF backgroundColor, COLORREF textColor) const {
     if (!m_hToolTip || !IsWindow(m_hToolTip)) {
         return;
     }
@@ -57,7 +57,7 @@ void Tooltil::SetStyle(HFONT font, COLORREF backgroundColor, COLORREF textColor)
     }
 }
 
-bool Tooltil::AddTool(HWND control, const std::wstring& text) {
+bool ToolTip::AddTool(HWND control, const std::wstring& text) {
     if (!m_hToolTip || !control || !IsWindow(control) || text.empty()) {
         return false;
     }
@@ -80,7 +80,7 @@ bool Tooltil::AddTool(HWND control, const std::wstring& text) {
     return SendMessageW(m_hToolTip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&toolInfo)) != FALSE;
 }
 
-void Tooltil::RelayEvent(const MSG& message) const {
+void ToolTip::RelayEvent(const MSG& message) const {
     if (!m_hToolTip || !IsWindow(m_hToolTip)) {
         return;
     }
@@ -111,7 +111,7 @@ void Tooltil::RelayEvent(const MSG& message) const {
     }
 }
 
-void Tooltil::Destroy() {
+void ToolTip::Destroy() {
     if (m_hToolTip && IsWindow(m_hToolTip)) {
         DestroyWindow(m_hToolTip);
     }

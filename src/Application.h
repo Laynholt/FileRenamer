@@ -5,7 +5,6 @@
 #endif
 
 #include <windows.h>
-#include <gdiplus.h>
 
 #include "RenamerService.h"
 
@@ -15,7 +14,7 @@
 #include <vector>
 
 class UpdateService;
-class Tooltil;
+class ToolTip;
 
 class Application {
 public:
@@ -127,7 +126,7 @@ private:
     HWND m_pressedControl;
     std::map<HWND, float> m_buttonHoverAlpha;
     std::unique_ptr<UpdateService> m_updateService;
-    std::unique_ptr<Tooltil> m_tooltil;
+    std::unique_ptr<ToolTip> m_tooltil;
 
     std::wstring m_lastExplorerFolder;
 

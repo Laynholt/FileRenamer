@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(FileRenamer
-    VERSION 1.0.0
+    VERSION 1.0.2
     DESCRIPTION "Pattern-based file renamer for Windows"
     LANGUAGES CXX RC
 )
@@ -19,7 +19,7 @@ set(SOURCES
     src/Application.cpp
     src/ExplorerPathProvider.cpp
     src/RenamerService.cpp
-    src/Tooltil.cpp
+    src/ToolTip.cpp
     src/UpdateService.cpp
     src/UiRenderer.cpp
     src/resource.rc
@@ -29,7 +29,7 @@ set(HEADERS
     src/Application.h
     src/ExplorerPathProvider.h
     src/RenamerService.h
-    src/Tooltil.h
+    src/ToolTip.h
     src/UpdateService.h
     src/UiRenderer.h
     src/resource.h
