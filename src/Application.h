@@ -37,6 +37,7 @@ private:
 
     static LRESULT CALLBACK WindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK TextEditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 
     void CreateControls();
     void CreateHelpMenu();
@@ -67,6 +68,7 @@ private:
                                 const wchar_t* primaryButtonText,
                                 const wchar_t* secondaryButtonText = nullptr);
     void ShowStyledMessage(const std::wstring& title, const std::wstring& message);
+    void ShowTextContextMenu(HWND targetControl, LPARAM lParam);
     static LRESULT CALLBACK InfoWindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK MessageWindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
 
