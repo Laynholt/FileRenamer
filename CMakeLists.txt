@@ -19,6 +19,7 @@ set(SOURCES
     src/Application.cpp
     src/ExplorerPathProvider.cpp
     src/RenamerService.cpp
+    src/Tooltil.cpp
     src/UpdateService.cpp
     src/UiRenderer.cpp
     src/resource.rc
@@ -28,6 +29,7 @@ set(HEADERS
     src/Application.h
     src/ExplorerPathProvider.h
     src/RenamerService.h
+    src/Tooltil.h
     src/UpdateService.h
     src/UiRenderer.h
     src/resource.h

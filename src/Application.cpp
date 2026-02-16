@@ -3,6 +3,7 @@
 
 #include "ExplorerPathProvider.h"
 #include "RenamerService.h"
+#include "Tooltil.h"
 #include "UiRenderer.h"
 #include "UpdateService.h"
 #include "resource.h"
@@ -30,7 +31,7 @@ namespace {
 const wchar_t* WINDOW_CLASS_NAME = L"FileRenamerWinApiClass";
 const wchar_t* INFO_WINDOW_CLASS_NAME = L"FileRenamerInfoWindowClass";
 const wchar_t* MESSAGE_WINDOW_CLASS_NAME = L"FileRenamerMessageWindowClass";
-const wchar_t* APP_VERSION = L"1.0.1";
+const wchar_t* APP_VERSION = L"1.0.2";
 
 enum ControlId {
     ID_FOLDER_EDIT = 1001,
@@ -274,6 +275,10 @@ bool Application::Initialize(HINSTANCE hInstance) {
 int Application::Run() {
     MSG msg = {};
     while (GetMessage(&msg, nullptr, 0, 0)) {
+        if (m_tooltil) {
+            m_tooltil->RelayEvent(msg);
+        }
+
         bool handled = false;
         if ((msg.message == WM_KEYDOWN || msg.message == WM_CHAR) &&
             (msg.hwnd == m_hWnd || (m_hWnd && IsChild(m_hWnd, msg.hwnd)))) {
@@ -348,6 +353,8 @@ void Application::Shutdown() {
     if (m_hWnd && IsWindow(m_hWnd)) {
         KillTimer(m_hWnd, EXPLORER_SYNC_TIMER_ID);
     }
+
+    m_tooltil.reset();
 
     if (m_hHelpMenu) {
         DestroyMenu(m_hHelpMenu);
@@ -958,6 +965,23 @@ void Application::CreateControls() {
     m_buttonHoverAlpha[m_hBrowseButton] = 0.0f;
     m_buttonHoverAlpha[m_hRenameButton] = 0.0f;
     m_buttonHoverAlpha[m_hHelpButton] = 0.0f;
+
+    m_tooltil = std::make_unique<Tooltil>();
+    if (m_tooltil->Initialize(m_hWnd)) {
+        m_tooltil->SetStyle(m_hFont, RGB(45, 45, 45), RGB(235, 235, 235));
+
+        const std::wstring patternTooltip = L"Текст или regex-шаблон, который нужно найти в имени файла или папки.";
+        const std::wstring replacementTooltip =
+            L"Текст замены. Оставьте пустым, чтобы удалить найденный паттерн.\r\n"
+            L"С пустым паттерном: <text добавляет text в начало, >text добавляет text в конец имени.";
+
+        m_tooltil->AddTool(m_hPatternLabel, patternTooltip);
+        m_tooltil->AddTool(m_hPatternEdit, patternTooltip);
+        m_tooltil->AddTool(m_hReplacementLabel, replacementTooltip);
+        m_tooltil->AddTool(m_hReplacementEdit, replacementTooltip);
+    } else {
+        m_tooltil.reset();
+    }
 }
 
 void Application::CreateHelpMenu() {

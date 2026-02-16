@@ -15,6 +15,7 @@
 #include <vector>
 
 class UpdateService;
+class Tooltil;
 
 class Application {
 public:
@@ -126,6 +127,7 @@ private:
     HWND m_pressedControl;
     std::map<HWND, float> m_buttonHoverAlpha;
     std::unique_ptr<UpdateService> m_updateService;
+    std::unique_ptr<Tooltil> m_tooltil;
 
     std::wstring m_lastExplorerFolder;
 
