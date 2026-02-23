@@ -2,12 +2,15 @@
 
 #include <windows.h>
 #include <objbase.h>
+#include <shlwapi.h>
 
 #include <algorithm>
 #include <cwctype>
 #include <optional>
 #include <regex>
 #include <set>
+
+#pragma comment(lib, "Shlwapi.lib")
 
 namespace fs = std::filesystem;
 
@@ -192,6 +195,10 @@ CollectResult CollectOperations(
     }
 
     std::sort(entries.begin(), entries.end(), [](const EntryInfo& left, const EntryInfo& right) {
+        const int compareResult = StrCmpLogicalW(left.name.c_str(), right.name.c_str());
+        if (compareResult != 0) {
+            return compareResult < 0;
+        }
         return left.name < right.name;
     });
 

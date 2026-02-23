@@ -15,6 +15,8 @@
 #include <shobjidl.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cwctype>
 #include <filesystem>
 
@@ -31,7 +33,7 @@ namespace {
 const wchar_t* WINDOW_CLASS_NAME = L"FileRenamerWinApiClass";
 const wchar_t* INFO_WINDOW_CLASS_NAME = L"FileRenamerInfoWindowClass";
 const wchar_t* MESSAGE_WINDOW_CLASS_NAME = L"FileRenamerMessageWindowClass";
-const wchar_t* APP_VERSION = L"1.0.2";
+const wchar_t* APP_VERSION = L"1.0.3";
 
 enum ControlId {
     ID_FOLDER_EDIT = 1001,
@@ -92,6 +94,7 @@ struct MessageWindowState {
 };
 
 constexpr UINT_PTR TEXT_CONTEXT_SUBCLASS_ID = 1;
+constexpr UINT WM_APP_FOLDER_CONTENT_CHANGED = WM_APP + 1;
 
 std::wstring Trim(const std::wstring& text) {
     size_t begin = 0;
@@ -350,8 +353,11 @@ int Application::Run() {
 }
 
 void Application::Shutdown() {
+    StopFolderWatcher();
+
     if (m_hWnd && IsWindow(m_hWnd)) {
         KillTimer(m_hWnd, EXPLORER_SYNC_TIMER_ID);
+        KillTimer(m_hWnd, FOLDER_WATCH_DEBOUNCE_TIMER_ID);
     }
 
     m_tooltil.reset();
@@ -416,6 +422,13 @@ LRESULT CALLBACK Application::WindowProc(HWND hWnd, UINT message, WPARAM wParam,
 
 LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_APP_FOLDER_CONTENT_CHANGED:
+        m_folderWatchRefreshPosted.store(false);
+        if (m_hWnd && IsWindow(m_hWnd)) {
+            SetTimer(m_hWnd, FOLDER_WATCH_DEBOUNCE_TIMER_ID, FOLDER_WATCH_DEBOUNCE_INTERVAL_MS, nullptr);
+        }
+        return 0;
+
     case WM_COMMAND:
         if (lParam == 0) {
             OnMenuCommand(LOWORD(wParam));
@@ -556,6 +569,12 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
 
+    case WM_MOUSEWHEEL:
+        if (HandlePreviewMouseWheel(wParam, lParam)) {
+            return 0;
+        }
+        break;
+
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT) {
             POINT cursorPos = {};
@@ -648,6 +667,11 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_TIMER:
         if (wParam == EXPLORER_SYNC_TIMER_ID) {
             SyncFolderFromExplorer();
+            return 0;
+        }
+        if (wParam == FOLDER_WATCH_DEBOUNCE_TIMER_ID) {
+            KillTimer(m_hWnd, FOLDER_WATCH_DEBOUNCE_TIMER_ID);
+            UpdatePreview();
         }
         return 0;
 
@@ -660,6 +684,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_DESTROY:
+        StopFolderWatcher();
         PostQuitMessage(0);
         return 0;
     }
@@ -2009,8 +2034,11 @@ LRESULT CALLBACK Application::MessageWindowProc(HWND hWnd, UINT message, WPARAM 
 
 LRESULT CALLBACK Application::TextEditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
     UNREFERENCED_PARAMETER(uIdSubclass);
-    UNREFERENCED_PARAMETER(wParam);
     auto* app = reinterpret_cast<Application*>(dwRefData);
+
+    if (uMsg == WM_MOUSEWHEEL && app && app->HandlePreviewMouseWheel(wParam, lParam)) {
+        return 0;
+    }
 
     if (uMsg == WM_CONTEXTMENU && app) {
         app->ShowTextContextMenu(hWnd, lParam);
@@ -2024,6 +2052,7 @@ void Application::UpdatePreview() {
     const std::wstring folderText = Trim(GetEditText(m_hFolderEdit));
     const std::wstring pattern = GetEditText(m_hPatternEdit);
     const std::wstring replacement = GetEditText(m_hReplacementEdit);
+    UpdateFolderWatcher(folderText);
     RenamerCore::CollectResult result = RenamerCore::CollectOperations(
         folderText,
         pattern,
@@ -2171,6 +2200,167 @@ void Application::SyncFolderFromExplorer() {
     }
 }
 
+void Application::UpdateFolderWatcher(const std::wstring& folderText) {
+    const std::wstring folder = Trim(folderText);
+    const std::wstring folderKey = PathCompareKey(folder);
+    if (folderKey.empty()) {
+        StopFolderWatcher();
+        return;
+    }
+
+    std::error_code ec;
+    if (!fs::is_directory(fs::path(folder), ec)) {
+        StopFolderWatcher();
+        return;
+    }
+
+    if (folderKey == m_watchedFolderKey && m_folderWatchThread.joinable()) {
+        return;
+    }
+
+    StopFolderWatcher();
+
+    HANDLE directoryHandle = CreateFileW(
+        folder.c_str(),
+        FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+        nullptr
+    );
+    if (directoryHandle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    HANDLE stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!stopEvent) {
+        CloseHandle(directoryHandle);
+        return;
+    }
+
+    m_watchedFolderKey = folderKey;
+    m_folderWatchDirectoryHandle = directoryHandle;
+    m_folderWatchStopEvent = stopEvent;
+    m_folderWatchRefreshPosted.store(false);
+    m_folderWatchThread = std::thread(&Application::FolderWatcherThreadProc, this, directoryHandle, stopEvent);
+}
+
+void Application::StopFolderWatcher() {
+    m_watchedFolderKey.clear();
+    m_folderWatchRefreshPosted.store(false);
+    if (m_hWnd && IsWindow(m_hWnd)) {
+        KillTimer(m_hWnd, FOLDER_WATCH_DEBOUNCE_TIMER_ID);
+    }
+
+    if (m_folderWatchStopEvent) {
+        SetEvent(m_folderWatchStopEvent);
+    }
+
+    if (m_folderWatchDirectoryHandle != INVALID_HANDLE_VALUE) {
+        CancelIoEx(m_folderWatchDirectoryHandle, nullptr);
+    }
+
+    if (m_folderWatchThread.joinable()) {
+        m_folderWatchThread.join();
+    }
+
+    if (m_folderWatchDirectoryHandle != INVALID_HANDLE_VALUE) {
+        CloseHandle(m_folderWatchDirectoryHandle);
+        m_folderWatchDirectoryHandle = INVALID_HANDLE_VALUE;
+    }
+
+    if (m_folderWatchStopEvent) {
+        CloseHandle(m_folderWatchStopEvent);
+        m_folderWatchStopEvent = nullptr;
+    }
+}
+
+void Application::FolderWatcherThreadProc(HANDLE directoryHandle, HANDLE stopEvent) {
+    std::array<std::uint8_t, 16 * 1024> buffer = {};
+    HANDLE ioEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ioEvent) {
+        return;
+    }
+
+    const DWORD notifyFilter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME;
+
+    for (;;) {
+        if (WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0) {
+            break;
+        }
+
+        OVERLAPPED overlapped = {};
+        overlapped.hEvent = ioEvent;
+        ResetEvent(ioEvent);
+
+        BOOL readStarted = ReadDirectoryChangesW(
+            directoryHandle,
+            buffer.data(),
+            static_cast<DWORD>(buffer.size()),
+            FALSE,
+            notifyFilter,
+            nullptr,
+            &overlapped,
+            nullptr
+        );
+
+        if (!readStarted) {
+            const DWORD readError = GetLastError();
+            if (readError != ERROR_IO_PENDING) {
+                break;
+            }
+        }
+
+        HANDLE waitHandles[2] = { stopEvent, ioEvent };
+        const DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
+        if (waitResult == WAIT_OBJECT_0) {
+            CancelIoEx(directoryHandle, &overlapped);
+            break;
+        }
+
+        if (waitResult != (WAIT_OBJECT_0 + 1)) {
+            CancelIoEx(directoryHandle, &overlapped);
+            break;
+        }
+
+        DWORD bytesTransferred = 0;
+        if (!GetOverlappedResult(directoryHandle, &overlapped, &bytesTransferred, FALSE)) {
+            const DWORD resultError = GetLastError();
+            if (resultError == ERROR_OPERATION_ABORTED) {
+                break;
+            }
+            if (resultError == ERROR_NOTIFY_ENUM_DIR) {
+                PostFolderWatcherRefresh();
+                continue;
+            }
+            break;
+        }
+
+        if (bytesTransferred > 0) {
+            PostFolderWatcherRefresh();
+        }
+    }
+
+    CloseHandle(ioEvent);
+}
+
+void Application::PostFolderWatcherRefresh() {
+    if (m_folderWatchRefreshPosted.exchange(true)) {
+        return;
+    }
+
+    HWND targetWindow = m_hWnd;
+    if (!targetWindow || !IsWindow(targetWindow)) {
+        m_folderWatchRefreshPosted.store(false);
+        return;
+    }
+
+    if (!PostMessageW(targetWindow, WM_APP_FOLDER_CONTENT_CHANGED, 0, 0)) {
+        m_folderWatchRefreshPosted.store(false);
+    }
+}
+
 std::wstring Application::GetEditText(HWND control) const {
     if (!control) {
         return L"";
@@ -2197,6 +2387,43 @@ void Application::SetStatusText(const std::wstring& text) {
     if (m_hStatusLabel) {
         SetWindowTextW(m_hStatusLabel, text.c_str());
     }
+}
+
+bool Application::HandlePreviewMouseWheel(WPARAM wParam, LPARAM lParam) {
+    POINT screenPoint = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+    const HWND hoveredWindow = WindowFromPoint(screenPoint);
+    if (hoveredWindow != m_hCurrentPreview && hoveredWindow != m_hResultPreview) {
+        return false;
+    }
+
+    static int wheelDeltaRemainder = 0;
+    wheelDeltaRemainder += GET_WHEEL_DELTA_WPARAM(wParam);
+
+    int notches = wheelDeltaRemainder / WHEEL_DELTA;
+    wheelDeltaRemainder %= WHEEL_DELTA;
+    if (notches == 0) {
+        return true;
+    }
+
+    UINT linesPerNotch = 3;
+    SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &linesPerNotch, 0);
+    const int direction = (notches > 0) ? -1 : 1;
+    const int notchCount = (notches > 0) ? notches : -notches;
+
+    if (linesPerNotch == WHEEL_PAGESCROLL) {
+        const WPARAM scrollCommand = (direction < 0) ? SB_PAGEUP : SB_PAGEDOWN;
+        for (int index = 0; index < notchCount; ++index) {
+            SendMessageW(hoveredWindow, EM_SCROLL, scrollCommand, 0);
+        }
+        return true;
+    }
+
+    if (linesPerNotch > 0) {
+        const int totalLines = static_cast<int>(linesPerNotch) * notchCount * direction;
+        SendMessageW(hoveredWindow, EM_LINESCROLL, 0, totalLines);
+    }
+
+    return true;
 }
 
 void Application::UpdateHoverState(POINT clientPoint) {

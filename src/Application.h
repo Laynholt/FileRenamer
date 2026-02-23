@@ -8,9 +8,11 @@
 
 #include "RenamerService.h"
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 class UpdateService;
@@ -54,6 +56,10 @@ private:
 
     void PrefillFolderFromExplorer();
     void SyncFolderFromExplorer();
+    void UpdateFolderWatcher(const std::wstring& folderText);
+    void StopFolderWatcher();
+    void FolderWatcherThreadProc(HANDLE directoryHandle, HANDLE stopEvent);
+    void PostFolderWatcherRefresh();
 
     bool RegisterInfoWindowClass();
     bool RegisterMessageWindowClass();
@@ -75,6 +81,7 @@ private:
     std::wstring GetEditText(HWND control) const;
     void SetEditText(HWND control, const std::wstring& text);
     void SetStatusText(const std::wstring& text);
+    bool HandlePreviewMouseWheel(WPARAM wParam, LPARAM lParam);
 
     void UpdateHoverState(POINT clientPoint);
     bool IsPointInControl(HWND control, POINT clientPoint) const;
@@ -129,10 +136,17 @@ private:
     std::unique_ptr<ToolTip> m_tooltil;
 
     std::wstring m_lastExplorerFolder;
+    std::wstring m_watchedFolderKey;
+    HANDLE m_folderWatchDirectoryHandle = INVALID_HANDLE_VALUE;
+    HANDLE m_folderWatchStopEvent = nullptr;
+    std::thread m_folderWatchThread;
+    std::atomic_bool m_folderWatchRefreshPosted { false };
 
     static constexpr int PREVIEW_LIMIT = 400;
     static constexpr UINT_PTR EXPLORER_SYNC_TIMER_ID = 1;
+    static constexpr UINT_PTR FOLDER_WATCH_DEBOUNCE_TIMER_ID = 2;
     static constexpr UINT EXPLORER_SYNC_INTERVAL_MS = 300;
+    static constexpr UINT FOLDER_WATCH_DEBOUNCE_INTERVAL_MS = 100;
     static constexpr int MIN_WINDOW_WIDTH = 860;
     static constexpr int MIN_WINDOW_HEIGHT = 620;
 };
