@@ -208,6 +208,21 @@ std::wstring EscapePowerShellSingleQuoted(const std::wstring& value) {
 
     return escaped;
 }
+
+std::wstring GetWindowsPowerShellPath() {
+    wchar_t systemDirectory[MAX_PATH] = {};
+    const UINT length = GetSystemDirectoryW(systemDirectory, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return L"";
+    }
+
+    std::wstring path = systemDirectory;
+    if (!path.empty() && path.back() != L'\\') {
+        path.push_back(L'\\');
+    }
+    path += L"WindowsPowerShell\\v1.0\\powershell.exe";
+    return path;
+}
 } // namespace
 
 UpdateCheckResult UpdateService::CheckForUpdates(const std::wstring& currentVersion) const {
@@ -372,13 +387,27 @@ bool UpdateService::LaunchUpdaterProcess(DWORD currentProcessId,
     script << L"$pidToWait=" << currentProcessId << L";";
     script << L"$download='" << EscapePowerShellSingleQuoted(downloadedExePath) << L"';";
     script << L"$target='" << EscapePowerShellSingleQuoted(targetExePath) << L"';";
+    script << L"$ErrorActionPreference='Stop';";
+    script << L"try {";
     script << L"while (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 500 };";
     script << L"Copy-Item -LiteralPath $download -Destination $target -Force;";
-    script << L"Start-Process -FilePath $target;";
+    script << L"if (!(Test-Path -LiteralPath $target)) { throw 'Updated executable was not written.' };";
+    script << L"Start-Process -FilePath $target -ErrorAction Stop | Out-Null;";
     script << L"Remove-Item -LiteralPath $download -Force -ErrorAction SilentlyContinue;";
+    script << L"} catch {";
+    script << L"Add-Type -AssemblyName System.Windows.Forms;";
+    script << L"[System.Windows.Forms.MessageBox]::Show('Update installation failed.' + [Environment]::NewLine + [Environment]::NewLine + $_.Exception.Message, 'Update error') | Out-Null;";
+    script << L"exit 1;";
+    script << L"}";
+
+    const std::wstring powerShellPath = GetWindowsPowerShellPath();
+    if (powerShellPath.empty()) {
+        errorMessage = L"Failed to resolve the PowerShell executable path.";
+        return false;
+    }
 
     std::wstring commandLine =
-        L"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"" +
+        L"\"" + powerShellPath + L"\" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"" +
         script.str() + L"\"";
 
     STARTUPINFOW startupInfo = {};
@@ -388,7 +417,7 @@ bool UpdateService::LaunchUpdaterProcess(DWORD currentProcessId,
     mutableCommand.push_back(L'\0');
 
     if (!CreateProcessW(
-            nullptr,
+            powerShellPath.c_str(),
             mutableCommand.data(),
             nullptr,
             nullptr,

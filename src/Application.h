@@ -15,8 +15,8 @@
 #include <thread>
 #include <vector>
 
-class UpdateService;
 class ToolTip;
+struct UpdateCheckResult;
 
 class Application {
 public:
@@ -69,6 +69,10 @@ private:
     void CreateOrActivateInfoWindow(InfoWindowKind kind, HWND& targetHandle, const wchar_t* title, const std::wstring& bodyText);
     void OnInfoWindowClosed(InfoWindowKind kind);
     void CheckForUpdates();
+    void StartUpdateInstallation(const std::wstring& releaseTag);
+    void HandleUpdateCheckCompleted(const UpdateCheckResult& result);
+    void HandleUpdateInstallationCompleted(bool success, const std::wstring& errorMessage);
+    void SetUpdateBusy(bool busy);
     int ShowStyledMessageDialog(const wchar_t* title,
                                 const std::wstring& bodyText,
                                 const wchar_t* primaryButtonText,
@@ -128,11 +132,11 @@ private:
     bool m_ignoreCase;
     bool m_infoWindowClassRegistered;
     bool m_messageWindowClassRegistered;
+    bool m_updateBusy;
 
     HWND m_hoveredControl;
     HWND m_pressedControl;
     std::map<HWND, float> m_buttonHoverAlpha;
-    std::unique_ptr<UpdateService> m_updateService;
     std::unique_ptr<ToolTip> m_tooltil;
 
     std::wstring m_lastExplorerFolder;

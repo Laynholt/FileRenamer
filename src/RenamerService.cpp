@@ -133,10 +133,7 @@ std::wstring PathKey(const fs::path& path) {
     std::error_code absoluteEc;
     const fs::path absolutePath = fs::absolute(path, absoluteEc);
     std::wstring key = absoluteEc ? path.wstring() : absolutePath.lexically_normal().wstring();
-    std::transform(key.begin(), key.end(), key.begin(), [](wchar_t ch) {
-        return static_cast<wchar_t>(std::towlower(ch));
-    });
-    return key;
+    return ToLowerCopy(key);
 }
 
 std::wstring MakeTempSuffix() {
@@ -414,12 +411,37 @@ ExecuteResult ExecuteRename(const std::vector<RenameOperation>& operations) {
     }
 
     if (failed) {
-        for (const TempMapping& mapping : tempMapping) {
+        bool rollbackFailed = false;
+
+        for (auto it = tempMapping.rbegin(); it != tempMapping.rend(); ++it) {
+            const TempMapping& mapping = *it;
+            std::error_code targetExistsEc;
+            const bool targetExists = fs::exists(mapping.targetPath, targetExistsEc);
+            std::error_code tempExistsEc;
+            const bool tempExists = fs::exists(mapping.tempPath, tempExistsEc);
+            if (targetExists && !tempExists) {
+                std::error_code rollbackEc;
+                fs::rename(mapping.targetPath, mapping.tempPath, rollbackEc);
+                if (rollbackEc) {
+                    rollbackFailed = true;
+                }
+            }
+        }
+
+        for (auto it = tempMapping.rbegin(); it != tempMapping.rend(); ++it) {
+            const TempMapping& mapping = *it;
             std::error_code existsEc;
             if (fs::exists(mapping.tempPath, existsEc)) {
                 std::error_code rollbackEc;
                 fs::rename(mapping.tempPath, mapping.oldPath, rollbackEc);
+                if (rollbackEc) {
+                    rollbackFailed = true;
+                }
             }
+        }
+
+        if (rollbackFailed) {
+            errorMessage += L" Rollback was only partially completed.";
         }
 
         return { ExecuteStatus::Error, errorMessage, 0 };

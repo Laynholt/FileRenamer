@@ -95,6 +95,13 @@ struct MessageWindowState {
 
 constexpr UINT_PTR TEXT_CONTEXT_SUBCLASS_ID = 1;
 constexpr UINT WM_APP_FOLDER_CONTENT_CHANGED = WM_APP + 1;
+constexpr UINT WM_APP_UPDATE_CHECK_COMPLETED = WM_APP + 2;
+constexpr UINT WM_APP_UPDATE_INSTALL_COMPLETED = WM_APP + 3;
+
+struct UpdateInstallResult {
+    bool success;
+    std::wstring errorMessage;
+};
 
 std::wstring Trim(const std::wstring& text) {
     size_t begin = 0;
@@ -210,6 +217,7 @@ Application::Application()
     , m_ignoreCase(false)
     , m_infoWindowClassRegistered(false)
     , m_messageWindowClassRegistered(false)
+    , m_updateBusy(false)
     , m_hoveredControl(nullptr)
     , m_pressedControl(nullptr) {
 }
@@ -292,8 +300,6 @@ bool Application::Initialize(HINSTANCE hInstance) {
         MessageBox(nullptr, L"Не удалось зарегистрировать класс диалога сообщений", L"Ошибка", MB_OK | MB_ICONERROR);
         return false;
     }
-    m_updateService = std::make_unique<UpdateService>();
-
     RECT clientRect = {};
     GetClientRect(m_hWnd, &clientRect);
     OnResize(clientRect.right - clientRect.left, clientRect.bottom - clientRect.top);
@@ -397,8 +403,6 @@ void Application::Shutdown() {
         m_hHelpMenu = nullptr;
     }
 
-    m_updateService.reset();
-
     if (m_hFont) {
         DeleteObject(m_hFont);
         m_hFont = nullptr;
@@ -456,6 +460,24 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         m_folderWatchRefreshPosted.store(false);
         if (m_hWnd && IsWindow(m_hWnd)) {
             SetTimer(m_hWnd, FOLDER_WATCH_DEBOUNCE_TIMER_ID, FOLDER_WATCH_DEBOUNCE_INTERVAL_MS, nullptr);
+        }
+        return 0;
+
+    case WM_APP_UPDATE_CHECK_COMPLETED:
+        {
+            std::unique_ptr<UpdateCheckResult> result(reinterpret_cast<UpdateCheckResult*>(lParam));
+            if (result) {
+                HandleUpdateCheckCompleted(*result);
+            }
+        }
+        return 0;
+
+    case WM_APP_UPDATE_INSTALL_COMPLETED:
+        {
+            std::unique_ptr<UpdateInstallResult> result(reinterpret_cast<UpdateInstallResult*>(lParam));
+            if (result) {
+                HandleUpdateInstallationCompleted(result->success, result->errorMessage);
+            }
         }
         return 0;
 
@@ -1598,111 +1620,149 @@ void Application::ShowStyledMessage(const std::wstring& title, const std::wstrin
 }
 
 void Application::CheckForUpdates() {
-    const wchar_t* checkUpdatesTitle = L"Проверка обновлений";
-    const wchar_t* updateTitle = L"Обновление";
-
-    if (!m_updateService) {
-        m_updateService = std::make_unique<UpdateService>();
-    }
-    if (!m_updateService) {
-        ShowStyledMessageDialog(checkUpdatesTitle, L"Сервис обновлений не инициализирован", L"Закрыть");
+    if (m_updateBusy) {
         return;
     }
 
-    SetCursor(LoadCursor(nullptr, IDC_WAIT));
-    SetStatusText(L"Проверка обновлений...");
-    const UpdateCheckResult checkResult = m_updateService->CheckForUpdates(APP_VERSION);
-    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+    SetUpdateBusy(true);
+    SetStatusText(L"Checking for updates...");
+
+    const HWND targetWindow = m_hWnd;
+    std::thread([targetWindow]() {
+        auto* result = new UpdateCheckResult(UpdateService().CheckForUpdates(APP_VERSION));
+        if (!targetWindow || !IsWindow(targetWindow) ||
+            !PostMessageW(targetWindow, WM_APP_UPDATE_CHECK_COMPLETED, 0, reinterpret_cast<LPARAM>(result))) {
+            delete result;
+        }
+    }).detach();
+}
+void Application::StartUpdateInstallation(const std::wstring& releaseTag) {
+    SetStatusText(L"Downloading update...");
+
+    const HWND targetWindow = m_hWnd;
+    std::thread([targetWindow, releaseTag]() {
+        auto postResult = [targetWindow](UpdateInstallResult* result) {
+            if (!targetWindow || !IsWindow(targetWindow) ||
+                !PostMessageW(targetWindow, WM_APP_UPDATE_INSTALL_COMPLETED, 0, reinterpret_cast<LPARAM>(result))) {
+                delete result;
+            }
+        };
+
+        auto* result = new UpdateInstallResult{ false, L"" };
+        UpdateService updateService;
+
+        wchar_t tempPath[MAX_PATH] = {};
+        const DWORD tempPathLength = GetTempPathW(MAX_PATH, tempPath);
+        if (tempPathLength == 0 || tempPathLength >= MAX_PATH) {
+            result->errorMessage = L"Failed to resolve the temp directory.";
+            postResult(result);
+            return;
+        }
+
+        std::wstring downloadedExePath = tempPath;
+        if (!downloadedExePath.empty() && downloadedExePath.back() != L'\\') {
+            downloadedExePath.push_back(L'\\');
+        }
+        downloadedExePath += L"FileRenamer_update.exe";
+
+        if (!updateService.DownloadReleaseExecutable(releaseTag, downloadedExePath, result->errorMessage)) {
+            postResult(result);
+            return;
+        }
+
+        wchar_t currentExePath[MAX_PATH] = {};
+        const DWORD currentExePathLength = GetModuleFileNameW(nullptr, currentExePath, MAX_PATH);
+        if (currentExePathLength == 0 || currentExePathLength >= MAX_PATH) {
+            DeleteFileW(downloadedExePath.c_str());
+            result->errorMessage = L"Failed to resolve the current executable path.";
+            postResult(result);
+            return;
+        }
+
+        if (!updateService.LaunchUpdaterProcess(GetCurrentProcessId(), downloadedExePath, currentExePath, result->errorMessage)) {
+            DeleteFileW(downloadedExePath.c_str());
+            postResult(result);
+            return;
+        }
+
+        result->success = true;
+        postResult(result);
+    }).detach();
+}
+
+void Application::HandleUpdateCheckCompleted(const UpdateCheckResult& checkResult) {
+    const wchar_t* checkUpdatesTitle = L"Update Check";
 
     if (!checkResult.success) {
-        std::wstring message = L"Не удалось проверить обновления.\r\n\r\n";
+        SetUpdateBusy(false);
+        std::wstring message = L"Failed to check for updates.\r\n\r\n";
         message += checkResult.errorMessage;
-        ShowStyledMessageDialog(checkUpdatesTitle, message, L"Закрыть");
-        SetStatusText(L"Ошибка проверки обновлений");
+        ShowStyledMessageDialog(checkUpdatesTitle, message, L"Close");
+        SetStatusText(L"Update check failed");
         return;
     }
 
     const std::wstring latestVersion = checkResult.latestVersion.empty() ? checkResult.latestTag : checkResult.latestVersion;
     if (!checkResult.updateAvailable) {
-        std::wstring message = L"Установлена последняя версия приложения.";
+        SetUpdateBusy(false);
+        std::wstring message = L"You already have the latest version.";
         if (!latestVersion.empty()) {
-            message += L"\r\n\r\nТекущая версия: ";
+            message += L"\r\n\r\nCurrent version: ";
             message += APP_VERSION;
-            message += L"\r\nПоследний релиз: ";
+            message += L"\r\nLatest release: ";
             message += latestVersion;
         }
-        ShowStyledMessageDialog(checkUpdatesTitle, message, L"Закрыть");
-        SetStatusText(L"Установлена последняя версия");
+        ShowStyledMessageDialog(checkUpdatesTitle, message, L"Close");
+        SetStatusText(L"Already up to date");
         return;
     }
 
-    std::wstring message = L"Доступна новая версия: ";
+    std::wstring message = L"A new version is available: ";
     message += latestVersion.empty() ? checkResult.latestTag : latestVersion;
-    message += L"\r\nТекущая версия: ";
+    message += L"\r\nCurrent version: ";
     message += APP_VERSION;
-    message += L"\r\n\r\nСкачать и установить обновление сейчас?";
+    message += L"\r\n\r\nDownload and install the update now?";
 
     const int userDecision = ShowStyledMessageDialog(
         checkUpdatesTitle,
         message,
-        L"Скачать",
-        L"Отмена"
+        L"Download",
+        L"Cancel"
     );
 
     if (userDecision != IDYES) {
-        SetStatusText(L"Обновление отменено");
+        SetUpdateBusy(false);
+        SetStatusText(L"Update canceled");
         return;
     }
 
-    wchar_t tempPath[MAX_PATH] = {};
-    const DWORD tempPathLength = GetTempPathW(MAX_PATH, tempPath);
-    if (tempPathLength == 0 || tempPathLength >= MAX_PATH) {
-        ShowStyledMessageDialog(updateTitle, L"Не удалось определить временную директорию", L"Закрыть");
-        SetStatusText(L"Ошибка загрузки обновления");
+    StartUpdateInstallation(checkResult.latestTag);
+}
+void Application::HandleUpdateInstallationCompleted(bool success, const std::wstring& errorMessage) {
+    const wchar_t* updateTitle = L"Update";
+
+    if (!success) {
+        SetUpdateBusy(false);
+        std::wstring message = L"Failed to start the update installer.\r\n\r\n";
+        message += errorMessage;
+        ShowStyledMessageDialog(updateTitle, message, L"Close");
+        SetStatusText(L"Update failed");
         return;
     }
 
-    std::wstring downloadedExePath = tempPath;
-    if (!downloadedExePath.empty() && downloadedExePath.back() != L'\\') {
-        downloadedExePath.push_back(L'\\');
-    }
-    downloadedExePath += L"FileRenamer_update.exe";
-
-    std::wstring downloadError;
-    SetCursor(LoadCursor(nullptr, IDC_WAIT));
-    SetStatusText(L"Загрузка обновления...");
-    const bool downloaded = m_updateService->DownloadReleaseExecutable(checkResult.latestTag, downloadedExePath, downloadError);
-    SetCursor(LoadCursor(nullptr, IDC_ARROW));
-
-    if (!downloaded) {
-        std::wstring errorMessage = L"Не удалось скачать обновление.\r\n\r\n";
-        errorMessage += downloadError;
-        ShowStyledMessageDialog(updateTitle, errorMessage, L"Закрыть");
-        SetStatusText(L"Ошибка загрузки обновления");
-        return;
-    }
-
-    wchar_t currentExePath[MAX_PATH] = {};
-    const DWORD currentExePathLength = GetModuleFileNameW(nullptr, currentExePath, MAX_PATH);
-    if (currentExePathLength == 0 || currentExePathLength >= MAX_PATH) {
-        DeleteFileW(downloadedExePath.c_str());
-        ShowStyledMessageDialog(updateTitle, L"Не удалось определить путь текущего приложения", L"Закрыть");
-        SetStatusText(L"Ошибка обновления");
-        return;
-    }
-
-    std::wstring launchError;
-    if (!m_updateService->LaunchUpdaterProcess(GetCurrentProcessId(), downloadedExePath, currentExePath, launchError)) {
-        DeleteFileW(downloadedExePath.c_str());
-        std::wstring errorMessage = L"Не удалось запустить установку обновления.\r\n\r\n";
-        errorMessage += launchError;
-        ShowStyledMessageDialog(updateTitle, errorMessage, L"Закрыть");
-        SetStatusText(L"Ошибка обновления");
-        return;
-    }
-
-    SetStatusText(L"Обновление готово. Перезапуск...");
+    SetStatusText(L"Updater started. Closing the application...");
     DestroyWindow(m_hWnd);
+}
+void Application::SetUpdateBusy(bool busy) {
+    m_updateBusy = busy;
+
+    if (m_hAboutWindow && IsWindow(m_hAboutWindow)) {
+        HWND checkUpdatesButton = GetDlgItem(m_hAboutWindow, ID_INFO_CHECK_UPDATES);
+        if (checkUpdatesButton) {
+            EnableWindow(checkUpdatesButton, !busy);
+            InvalidateRect(checkUpdatesButton, nullptr, TRUE);
+        }
+    }
 }
 
 LRESULT CALLBACK Application::InfoWindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -1764,6 +1824,9 @@ LRESULT CALLBACK Application::InfoWindowProc(HWND hWnd, UINT message, WPARAM wPa
                     GetModuleHandle(nullptr),
                     nullptr
                 );
+                if (state->checkUpdatesButton) {
+                    EnableWindow(state->checkUpdatesButton, !state->owner->m_updateBusy);
+                }
             }
 
             if (state->font) {
