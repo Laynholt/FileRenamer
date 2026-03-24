@@ -51,6 +51,40 @@ std::wstring ReplaceAll(const std::wstring& text, const std::wstring& pattern, c
 }
 
 std::wstring ToLowerCopy(const std::wstring& text) {
+    if (text.empty()) {
+        return text;
+    }
+
+    const int required = LCMapStringEx(
+        LOCALE_NAME_INVARIANT,
+        LCMAP_LOWERCASE | LCMAP_LINGUISTIC_CASING,
+        text.c_str(),
+        -1,
+        nullptr,
+        0,
+        nullptr,
+        nullptr,
+        0
+    );
+    if (required > 1) {
+        std::wstring lowered(static_cast<size_t>(required), L'\0');
+        const int written = LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_LOWERCASE | LCMAP_LINGUISTIC_CASING,
+            text.c_str(),
+            -1,
+            lowered.data(),
+            required,
+            nullptr,
+            nullptr,
+            0
+        );
+        if (written > 0) {
+            lowered.resize(static_cast<size_t>(written - 1));
+            return lowered;
+        }
+    }
+
     std::wstring lowered = text;
     std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](wchar_t ch) {
         return static_cast<wchar_t>(std::towlower(ch));

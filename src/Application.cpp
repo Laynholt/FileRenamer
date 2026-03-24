@@ -33,7 +33,7 @@ namespace {
 const wchar_t* WINDOW_CLASS_NAME = L"FileRenamerWinApiClass";
 const wchar_t* INFO_WINDOW_CLASS_NAME = L"FileRenamerInfoWindowClass";
 const wchar_t* MESSAGE_WINDOW_CLASS_NAME = L"FileRenamerMessageWindowClass";
-const wchar_t* APP_VERSION = L"1.0.3";
+const wchar_t* APP_VERSION = L"1.0.4";
 
 enum ControlId {
     ID_FOLDER_EDIT = 1001,
@@ -120,6 +120,36 @@ std::wstring PathCompareKey(const std::wstring& rawPath) {
     std::wstring key = absoluteEc
         ? fs::path(rawPath).lexically_normal().wstring()
         : absolutePath.lexically_normal().wstring();
+
+    const int required = LCMapStringEx(
+        LOCALE_NAME_INVARIANT,
+        LCMAP_LOWERCASE | LCMAP_LINGUISTIC_CASING,
+        key.c_str(),
+        -1,
+        nullptr,
+        0,
+        nullptr,
+        nullptr,
+        0
+    );
+    if (required > 1) {
+        std::wstring lowered(static_cast<size_t>(required), L'\0');
+        const int written = LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_LOWERCASE | LCMAP_LINGUISTIC_CASING,
+            key.c_str(),
+            -1,
+            lowered.data(),
+            required,
+            nullptr,
+            nullptr,
+            0
+        );
+        if (written > 0) {
+            lowered.resize(static_cast<size_t>(written - 1));
+            return lowered;
+        }
+    }
 
     std::transform(key.begin(), key.end(), key.begin(), [](wchar_t ch) {
         return static_cast<wchar_t>(std::towlower(ch));
