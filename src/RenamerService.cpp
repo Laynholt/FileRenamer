@@ -20,6 +20,58 @@ struct EntryInfo {
     bool isDirectory;
 };
 
+// Format the segments on either side of counters separately: $1{n} must not
+// turn into $11, and captured filenames containing {n} must remain literal data.
+std::wstring FormatReplacement(const std::wstring& text, size_t number, bool* hasCounter = nullptr,
+    const std::wsmatch* match = nullptr) {
+    std::wstring result;
+    size_t segmentStart = 0;
+    for (size_t i = 0; i < text.size();) {
+        size_t length = 0;
+        size_t width = 0;
+        if (text.compare(i, 3, L"{n}") == 0) {
+            length = 3;
+        } else if (text.compare(i, 4, L"{n:0") == 0) {
+            size_t end = i + 4;
+            while (end < text.size() && end < i + 6 && text[end] >= L'0' && text[end] <= L'9') {
+                width = width * 10 + static_cast<size_t>(text[end++] - L'0');
+            }
+            if (end > i + 4 && end < text.size() && text[end] == L'}' && width >= 1 && width <= 32) {
+                length = end - i + 1;
+            }
+        }
+        if (length) {
+            const auto segment = text.substr(segmentStart, i - segmentStart);
+            result += match ? match->format(segment) : segment;
+            if (hasCounter) *hasCounter = true;
+            std::wstring digits = std::to_wstring(number);
+            if (width > digits.size()) digits.insert(0, width - digits.size(), L'0');
+            result += digits;
+            i += length;
+            segmentStart = i;
+        } else {
+            ++i;
+        }
+    }
+    const auto segment = text.substr(segmentStart);
+    result += match ? match->format(segment) : segment;
+    return result;
+}
+
+std::wstring ReplaceRegex(const std::wstring& name, const std::wregex& expression,
+    const std::wstring& replacement, size_t number) {
+    std::wstring result;
+    size_t suffixStart = 0;
+    for (std::wsregex_iterator it(name.begin(), name.end(), expression), end; it != end; ++it) {
+        const auto& match = *it;
+        result += match.prefix().str();
+        result += FormatReplacement(replacement, number, nullptr, &match);
+        suffixStart = static_cast<size_t>(match.position() + match.length());
+    }
+    result += name.substr(suffixStart);
+    return result;
+}
+
 std::wstring Trim(const std::wstring& text) {
     size_t begin = 0;
     while (begin < text.size() && std::iswspace(text[begin])) {
@@ -173,6 +225,8 @@ CollectResult CollectOperations(
 
     const std::wstring folder = Trim(folderText);
     const bool hasPattern = !pattern.empty();
+    bool hasCounter = false;
+    FormatReplacement(replacement, 1, &hasCounter);
 
     if (folder.empty()) {
         result.status = L"Укажите папку.";
@@ -244,23 +298,26 @@ CollectResult CollectOperations(
         for (const EntryInfo& entry : entries) {
             const std::wstring& name = entry.name;
             std::wstring newName;
+            const std::wstring itemReplacement = FormatReplacement(replacement, result.totalCount + 1);
 
             if (useRegex) {
                 if (!std::regex_search(name, *regexPattern)) {
                     continue;
                 }
-                newName = std::regex_replace(name, *regexPattern, replacement);
+                newName = hasCounter
+                    ? ReplaceRegex(name, *regexPattern, replacement, result.totalCount + 1)
+                    : std::regex_replace(name, *regexPattern, replacement);
             } else {
                 if (ignoreCase) {
                     if (FindCaseInsensitive(name, pattern) == std::wstring::npos) {
                         continue;
                     }
-                    newName = ReplaceAllCaseInsensitive(name, pattern, replacement);
+                    newName = ReplaceAllCaseInsensitive(name, pattern, itemReplacement);
                 } else {
                     if (name.find(pattern) == std::wstring::npos) {
                         continue;
                     }
-                    newName = ReplaceAll(name, pattern, replacement);
+                    newName = ReplaceAll(name, pattern, itemReplacement);
                 }
             }
 
@@ -280,20 +337,22 @@ CollectResult CollectOperations(
     const bool isPrefixMode = !replacement.empty() && replacement.front() == L'<';
     const bool isSuffixMode = !replacement.empty() && replacement.front() == L'>';
 
-    if (isPrefixMode || isSuffixMode) {
+    if (isPrefixMode || isSuffixMode || hasCounter) {
         for (const EntryInfo& entry : entries) {
             const std::wstring& name = entry.name;
             std::wstring newName;
+            const std::wstring itemReplacement = FormatReplacement(replacement, result.totalCount + 1);
             if (isPrefixMode) {
-                newName = replacement.substr(1) + name;
+                newName = itemReplacement.substr(1) + name;
             } else {
+                const std::wstring text = isSuffixMode ? itemReplacement.substr(1) : itemReplacement;
                 if (entry.isDirectory) {
-                    newName = name + replacement.substr(1);
+                    newName = (isSuffixMode ? name : L"") + text;
                 } else {
                     const fs::path filePath(name);
                     const std::wstring stem = filePath.stem().wstring();
                     const std::wstring ext = filePath.extension().wstring();
-                    newName = stem + replacement.substr(1) + ext;
+                    newName = (isSuffixMode ? stem : L"") + text + ext;
                 }
             }
 

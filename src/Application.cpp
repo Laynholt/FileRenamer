@@ -7,9 +7,11 @@
 #include "UiRenderer.h"
 #include "UpdateService.h"
 #include "resource.h"
+#include <wcw/Runtime.h>
 
 #include <windowsx.h>
 #include <commctrl.h>
+#include <objidl.h>
 #include <gdiplus.h>
 #include <objbase.h>
 #include <shobjidl.h>
@@ -33,7 +35,7 @@ namespace {
 const wchar_t* WINDOW_CLASS_NAME = L"FileRenamerWinApiClass";
 const wchar_t* INFO_WINDOW_CLASS_NAME = L"FileRenamerInfoWindowClass";
 const wchar_t* MESSAGE_WINDOW_CLASS_NAME = L"FileRenamerMessageWindowClass";
-const wchar_t* APP_VERSION = L"1.0.4";
+const wchar_t* APP_VERSION = L"1.1.0";
 
 enum ControlId {
     ID_FOLDER_EDIT = 1001,
@@ -45,7 +47,9 @@ enum ControlId {
     ID_RENAME_BUTTON = 1007,
     ID_CURRENT_PREVIEW = 1008,
     ID_RESULT_PREVIEW = 1009,
-    ID_HELP_BUTTON = 1010
+    ID_HELP_BUTTON = 1010,
+    ID_PATTERN_SUGGESTIONS = 1011,
+    ID_REPLACEMENT_SUGGESTIONS = 1012
 };
 
 enum MenuId {
@@ -314,6 +318,11 @@ bool Application::Initialize(HINSTANCE hInstance) {
 int Application::Run() {
     MSG msg = {};
     while (GetMessage(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_LBUTTONDOWN && m_hSuggestionWindow &&
+            msg.hwnd != m_hSuggestionWindow && !IsChild(m_hSuggestionWindow, msg.hwnd) &&
+            msg.hwnd != m_suggestionTarget) {
+            HideSuggestions();
+        }
         if (m_tooltil) {
             m_tooltil->RelayEvent(msg);
         }
@@ -324,13 +333,14 @@ int Application::Run() {
             HWND focused = GetFocus();
 
             if (msg.message == WM_KEYDOWN) {
+                if (HandleSuggestionKey(msg.wParam)) continue;
                 switch (msg.wParam) {
                 case VK_TAB:
                     SelectFolder();
                     handled = true;
                     break;
                 case VK_RETURN:
-                    RenameFiles();
+                    if (!(msg.lParam & (1LL << 30))) RenameFiles();
                     handled = true;
                     break;
                 case VK_ESCAPE:
@@ -390,6 +400,13 @@ int Application::Run() {
 
 void Application::Shutdown() {
     StopFolderWatcher();
+    HideSuggestions();
+    if (m_hSuggestionWindow && IsWindow(m_hSuggestionWindow)) DestroyWindow(m_hSuggestionWindow);
+    m_hSuggestionWindow = nullptr;
+    if (m_widgetsInitialized) {
+        wcw::Shutdown();
+        m_widgetsInitialized = false;
+    }
 
     if (m_hWnd && IsWindow(m_hWnd)) {
         KillTimer(m_hWnd, EXPLORER_SYNC_TIMER_ID);
@@ -707,16 +724,28 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_SIZE:
+        HideSuggestions();
         OnResize(LOWORD(lParam), HIWORD(lParam));
         return 0;
+
+    case WM_MOVE:
+        HideSuggestions();
+        break;
 
     case WM_ACTIVATE:
         if (LOWORD(wParam) != WA_INACTIVE) {
             SyncFolderFromExplorer();
+        } else if (!m_applyingSuggestion) {
+            HideSuggestions();
         }
         return 0;
 
     case WM_TIMER:
+        if (wParam == SUGGESTION_TIMER_ID) {
+            KillTimer(m_hWnd, SUGGESTION_TIMER_ID);
+            ShowSuggestions(GetFocus());
+            return 0;
+        }
         if (wParam == EXPLORER_SYNC_TIMER_ID) {
             SyncFolderFromExplorer();
             return 0;
@@ -724,6 +753,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         if (wParam == FOLDER_WATCH_DEBOUNCE_TIMER_ID) {
             KillTimer(m_hWnd, FOLDER_WATCH_DEBOUNCE_TIMER_ID);
             UpdatePreview();
+            if (m_hSuggestionWindow && IsWindowVisible(m_hSuggestionWindow)) ScheduleSuggestions();
         }
         return 0;
 
@@ -1024,6 +1054,12 @@ void Application::CreateControls() {
     SetWindowSubclass(m_hCurrentPreview, TextEditSubclassProc, TEXT_CONTEXT_SUBCLASS_ID, reinterpret_cast<DWORD_PTR>(this));
     SetWindowSubclass(m_hResultPreview, TextEditSubclassProc, TEXT_CONTEXT_SUBCLASS_ID, reinterpret_cast<DWORD_PTR>(this));
 
+    m_hPatternSuggestionsButton = CreateWindowExW(0, L"BUTTON", L"Подсказки", WS_VISIBLE | WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+        0, 0, 0, 0, m_hWnd, reinterpret_cast<HMENU>(ID_PATTERN_SUGGESTIONS), m_hInstance, nullptr);
+    m_hReplacementSuggestionsButton = CreateWindowExW(0, L"BUTTON", L"Подсказки", WS_VISIBLE | WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+        0, 0, 0, 0, m_hWnd, reinterpret_cast<HMENU>(ID_REPLACEMENT_SUGGESTIONS), m_hInstance, nullptr);
+    EnableWindow(m_hPatternSuggestionsButton, FALSE);
+
     SendMessage(m_hRegexCheckbox, BM_SETCHECK, BST_UNCHECKED, 0);
     SendMessage(m_hIgnoreCaseCheckbox, BM_SETCHECK, BST_UNCHECKED, 0);
 
@@ -1042,20 +1078,25 @@ void Application::CreateControls() {
     m_buttonHoverAlpha[m_hBrowseButton] = 0.0f;
     m_buttonHoverAlpha[m_hRenameButton] = 0.0f;
     m_buttonHoverAlpha[m_hHelpButton] = 0.0f;
+    m_buttonHoverAlpha[m_hPatternSuggestionsButton] = 0.0f;
+    m_buttonHoverAlpha[m_hReplacementSuggestionsButton] = 0.0f;
 
     m_tooltil = std::make_unique<ToolTip>();
     if (m_tooltil->Initialize(m_hWnd)) {
         m_tooltil->SetStyle(m_hFont, RGB(45, 45, 45), RGB(235, 235, 235));
 
-        const std::wstring patternTooltip = L"Текст или regex-шаблон, который нужно найти в имени файла или папки.";
+        const std::wstring patternTooltip = L"Текст или regex-шаблон. В режиме regex: Ctrl+Space — предложения по именам в папке с объяснением и примером.";
         const std::wstring replacementTooltip =
             L"Текст замены. Оставьте пустым, чтобы удалить найденный паттерн.\r\n"
-            L"С пустым паттерном: <text добавляет text в начало, >text добавляет text в конец имени.";
+            L"{n} — счётчик с 1, {n:03} — 001, 002…; $1 — группа regex. Ctrl+Space — подсказки.\r\n"
+            L"С пустым паттерном: <text — в начало, >text — в конец; текст с {n} заменяет имя, сохраняя расширение.";
 
         m_tooltil->AddTool(m_hPatternLabel, patternTooltip);
         m_tooltil->AddTool(m_hPatternEdit, patternTooltip);
         m_tooltil->AddTool(m_hReplacementLabel, replacementTooltip);
         m_tooltil->AddTool(m_hReplacementEdit, replacementTooltip);
+        m_tooltil->AddTool(m_hPatternSuggestionsButton, L"Подобрать regex по именам в выбранной папке. Сначала включите «Использовать regex».");
+        m_tooltil->AddTool(m_hReplacementSuggestionsButton, L"Вставить счётчик или группу regex в позицию курсора (Ctrl+Space).");
     } else {
         m_tooltil.reset();
     }
@@ -1115,10 +1156,12 @@ void Application::OnResize(int width, int height) {
     MoveWindow(m_hBrowseButton, browseLeft, rowTop - 1, browseWidth, 30, TRUE);
 
     MoveWindow(m_hPatternLabel, contentLeft, rowTop + rowSpacing + 3, labelWidth - 8, 22, TRUE);
-    MoveWindow(m_hPatternEdit, controlLeft, rowTop + rowSpacing, contentRight - controlLeft, editHeight, TRUE);
+    MoveWindow(m_hPatternEdit, controlLeft, rowTop + rowSpacing, contentRight - controlLeft - 110, editHeight, TRUE);
+    MoveWindow(m_hPatternSuggestionsButton, contentRight - 100, rowTop + rowSpacing - 1, 100, 28, TRUE);
 
     MoveWindow(m_hReplacementLabel, contentLeft, rowTop + rowSpacing * 2 + 3, labelWidth - 8, 22, TRUE);
-    MoveWindow(m_hReplacementEdit, controlLeft, rowTop + rowSpacing * 2, contentRight - controlLeft, editHeight, TRUE);
+    MoveWindow(m_hReplacementEdit, controlLeft, rowTop + rowSpacing * 2, contentRight - controlLeft - 110, editHeight, TRUE);
+    MoveWindow(m_hReplacementSuggestionsButton, contentRight - 100, rowTop + rowSpacing * 2 - 1, 100, 28, TRUE);
 
     const int actionRowY = rowTop + rowSpacing * 3;
     MoveWindow(m_hRegexCheckbox, controlLeft, actionRowY, 210, 26, TRUE);
@@ -1182,9 +1225,19 @@ void Application::OnPaint() {
 }
 
 void Application::OnCommand(UINT controlId, UINT notifyCode) {
+    if (m_applyingSuggestion) return;
+    if (notifyCode == EN_SETFOCUS && (controlId == ID_PATTERN_EDIT || controlId == ID_REPLACEMENT_EDIT)) {
+        ScheduleSuggestions();
+        return;
+    }
+    if (notifyCode == EN_KILLFOCUS && (controlId == ID_PATTERN_EDIT || controlId == ID_REPLACEMENT_EDIT)) {
+        HideSuggestions();
+        return;
+    }
     if (notifyCode == EN_CHANGE) {
         if (controlId == ID_FOLDER_EDIT || controlId == ID_PATTERN_EDIT || controlId == ID_REPLACEMENT_EDIT) {
             UpdatePreview();
+            ScheduleSuggestions();
         }
         return;
     }
@@ -1194,6 +1247,14 @@ void Application::OnCommand(UINT controlId, UINT notifyCode) {
     }
 
     switch (controlId) {
+    case ID_PATTERN_SUGGESTIONS:
+    case ID_REPLACEMENT_SUGGESTIONS:
+        {
+            HWND target = controlId == ID_PATTERN_SUGGESTIONS ? m_hPatternEdit : m_hReplacementEdit;
+            SetFocus(target);
+            ShowSuggestions(target);
+        }
+        break;
     case ID_BROWSE_BUTTON:
         SelectFolder();
         break;
@@ -1203,12 +1264,20 @@ void Application::OnCommand(UINT controlId, UINT notifyCode) {
         SendMessage(m_hRegexCheckbox, BM_SETCHECK, m_useRegex ? BST_CHECKED : BST_UNCHECKED, 0);
         InvalidateRect(m_hRegexCheckbox, nullptr, TRUE);
         UpdatePreview();
+        EnableWindow(m_hPatternSuggestionsButton, m_useRegex);
+        if (m_useRegex) {
+            SetFocus(m_hPatternEdit);
+            ShowSuggestions(m_hPatternEdit);
+        } else {
+            HideSuggestions();
+        }
         break;
     case ID_IGNORE_CASE_CHECKBOX:
         m_ignoreCase = !m_ignoreCase;
         SendMessage(m_hIgnoreCaseCheckbox, BM_SETCHECK, m_ignoreCase ? BST_CHECKED : BST_UNCHECKED, 0);
         InvalidateRect(m_hIgnoreCaseCheckbox, nullptr, TRUE);
         UpdatePreview();
+        HideSuggestions();
         break;
 
     case ID_RENAME_BUTTON:
@@ -1414,6 +1483,9 @@ void Application::ShowTextContextMenu(HWND targetControl, LPARAM lParam) {
 void Application::ShowHotkeysWindow() {
     const std::wstring hotkeysText =
         L"Горячие клавиши:\r\n\r\n"
+        L"Ctrl+Space\t— подсказки в паттерне / замене\r\n"
+        L"В подсказках: ↑/↓ — выбор; Enter / двойной щелчок — вставить; Esc — закрыть\r\n"
+        L"{n} — счётчик с 1; {n:03} — 001, 002…; $1 — первая группа regex\r\n\r\n"
         L"Tab\t— открыть выбор папки\r\n"
         L"Enter\t— запустить переименование\r\n"
         L"Esc\t— снять фокус с поля ввода\r\n"
@@ -2192,6 +2264,7 @@ void Application::UpdatePreview() {
 }
 
 void Application::RenameFiles() {
+    HideSuggestions();
     const std::wstring folderText = Trim(GetEditText(m_hFolderEdit));
     const std::wstring pattern = GetEditText(m_hPatternEdit);
     const std::wstring replacement = GetEditText(m_hReplacementEdit);
@@ -2528,6 +2601,10 @@ void Application::UpdateHoverState(POINT clientPoint) {
         hovered = m_hRenameButton;
     } else if (IsPointInControl(m_hHelpButton, clientPoint)) {
         hovered = m_hHelpButton;
+    } else if (IsPointInControl(m_hPatternSuggestionsButton, clientPoint)) {
+        hovered = m_hPatternSuggestionsButton;
+    } else if (IsPointInControl(m_hReplacementSuggestionsButton, clientPoint)) {
+        hovered = m_hReplacementSuggestionsButton;
     } else if (IsPointInControl(m_hRegexCheckbox, clientPoint)) {
         hovered = m_hRegexCheckbox;
     } else if (IsPointInControl(m_hIgnoreCaseCheckbox, clientPoint)) {

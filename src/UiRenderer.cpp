@@ -1,5 +1,6 @@
 #include "UiRenderer.h"
 
+#include <objidl.h>
 #include <gdiplus.h>
 
 using namespace Gdiplus;

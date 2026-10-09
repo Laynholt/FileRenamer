@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include "RenamerService.h"
+#include "RenameSuggestions.h"
 
 #include <atomic>
 #include <map>
@@ -50,6 +51,17 @@ private:
 
     void UpdatePreview();
     void RenameFiles();
+
+    void ScheduleSuggestions();
+    void ShowSuggestions(HWND target);
+    void HideSuggestions();
+    void UpdateSuggestionDetails();
+    void LayoutSuggestionDetails();
+    void ApplySuggestion();
+    bool HandleSuggestionKey(WPARAM key);
+    static LRESULT CALLBACK SuggestionWindowProc(HWND, UINT, WPARAM, LPARAM);
+    static LRESULT CALLBACK SuggestionListProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+    static LRESULT CALLBACK SuggestionScrollProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 
     void SelectFolder();
     std::wstring BrowseForFolder() const;
@@ -104,6 +116,19 @@ private:
 
     HWND m_hReplacementLabel;
     HWND m_hReplacementEdit;
+    HWND m_hPatternSuggestionsButton = nullptr;
+    HWND m_hReplacementSuggestionsButton = nullptr;
+    HWND m_hSuggestionWindow = nullptr;
+    HWND m_hSuggestionList = nullptr;
+    HWND m_hSuggestionDetails = nullptr;
+    HWND m_hSuggestionListScroll = nullptr;
+    HWND m_hSuggestionDetailsScroll = nullptr;
+    bool m_widgetsInitialized = false;
+    HWND m_suggestionTarget = nullptr;
+    bool m_applyingSuggestion = false;
+    std::vector<RenamerCore::RenameSuggestion> m_suggestions;
+    std::wstring m_groupLabelPattern;
+    std::vector<std::wstring> m_groupLabels;
 
     HWND m_hRegexCheckbox;
     HWND m_hIgnoreCaseCheckbox;
@@ -149,6 +174,7 @@ private:
     static constexpr int PREVIEW_LIMIT = 400;
     static constexpr UINT_PTR EXPLORER_SYNC_TIMER_ID = 1;
     static constexpr UINT_PTR FOLDER_WATCH_DEBOUNCE_TIMER_ID = 2;
+    static constexpr UINT_PTR SUGGESTION_TIMER_ID = 3;
     static constexpr UINT EXPLORER_SYNC_INTERVAL_MS = 300;
     static constexpr UINT FOLDER_WATCH_DEBOUNCE_INTERVAL_MS = 100;
     static constexpr int MIN_WINDOW_WIDTH = 860;
