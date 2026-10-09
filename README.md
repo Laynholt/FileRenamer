@@ -43,20 +43,24 @@
 ### Требования
 
 - Windows 10/11
-- CMake 3.16+
+- CMake 4.2+ для генератора Visual Studio 2026
 - C++17-совместимый компилятор
-- Visual Studio 2022 (MSVC) с C++ toolchain
+- Microsoft Build Tools 2026 с компонентами C++ (MSVC v145) и Windows SDK; IDE Visual Studio необязательна
 
 ### Команды
 
 ```powershell
-cmake -S . -B build
-cmake --build build --config Release
+cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -T v145
+cmake --build build --config Release --parallel 2
 ```
 
 Готовый бинарник:
 
 - `build/bin/Release/FileRenamer.exe`
+
+Проверена сборка Release x64: MSVC 19.51.36260, Windows SDK 10.0.26100.0. При переходе с другой версии Visual Studio выполните команду конфигурации с `--fresh`: CMake пересоздаст свой кеш в существующей папке `build`.
+
+Для запуска этой сборки с динамическим CRT (`/MD`) установите актуальный [Microsoft Visual C++ Redistributable x64](https://aka.ms/vc14/vc_redist.x64.exe).
 
 ## Использование
 

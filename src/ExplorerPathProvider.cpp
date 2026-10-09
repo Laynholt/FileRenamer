@@ -1,8 +1,8 @@
 #include "ExplorerPathProvider.h"
 
 #include <windows.h>
-#include <exdisp.h>
 #include <objbase.h>
+#include <exdisp.h>
 #include <shlwapi.h>
 
 #include <filesystem>
